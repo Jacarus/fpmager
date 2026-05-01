@@ -6,6 +6,7 @@ const SpellProjectileScene = preload("res://Scenes/SpellProjectile/SpellProjecti
 const SpellImpactEffectScript = preload("res://Scripts/SpellImpactEffect.gd")
 const SpellCreationScene = preload("res://Scenes/SpellCreation/SpellCreationUI.tscn")
 const PushTestTargetScript = preload("res://Scenes/World/PushTestTarget.gd")
+const SpellNetworkCodecScript = preload("res://Scripts/SpellNetworkCodec.gd")
 const PLAYER_LOADOUT_CREDIT_LIMIT := 120
 
 var _player: Node3D
@@ -445,7 +446,7 @@ func _get_bot_difficulty_data() -> Dictionary:
 
 
 func _get_spell_data_cost(data: Dictionary) -> int:
-	return _spell_from_dict(data).calculate_credits()
+	return SpellNetworkCodecScript.from_dict(data).calculate_credits()
 
 
 func _make_bot_spell_data(spell_name: String, weights: Dictionary, shape: String, intensity: int, size: int, spell_range: int, speed: int, flags: Dictionary = {}) -> Dictionary:
@@ -531,7 +532,7 @@ func spawn_network_projectile(spell: SpellDefinition, from: Vector3, direction: 
 	var source_peer_id := 0
 	if source != null and source.has_method("get_network_peer_id"):
 		source_peer_id = int(source.get_network_peer_id())
-	_client_spawn_network_projectile.rpc(_spell_to_dict(spell), from, direction, source_peer_id)
+	_client_spawn_network_projectile.rpc(SpellNetworkCodecScript.to_dict(spell), from, direction, source_peer_id)
 
 
 @rpc("any_peer", "reliable")
@@ -543,7 +544,7 @@ func _client_spawn_network_projectile(spell_data: Dictionary, from: Vector3, dir
 	if source_peer_id == multiplayer.get_unique_id():
 		return
 	var source := _players.get(source_peer_id) as Node
-	_spawn_projectile_local(_spell_from_dict(spell_data), from, direction, source)
+	_spawn_projectile_local(SpellNetworkCodecScript.from_dict(spell_data), from, direction, source)
 
 
 func _spawn_projectile_local(spell: SpellDefinition, from: Vector3, direction: Vector3, source: Node, cast_server_time: float = -1.0) -> void:
@@ -555,7 +556,7 @@ func _spawn_projectile_local(spell: SpellDefinition, from: Vector3, direction: V
 func broadcast_spell_impact(spell: SpellDefinition, position: Vector3, normal: Vector3) -> void:
 	if multiplayer.multiplayer_peer == null or not multiplayer.is_server():
 		return
-	_client_spawn_spell_impact.rpc(_spell_to_dict(spell), position, normal)
+	_client_spawn_spell_impact.rpc(SpellNetworkCodecScript.to_dict(spell), position, normal)
 
 
 @rpc("any_peer", "reliable")
@@ -566,56 +567,9 @@ func _client_spawn_spell_impact(spell_data: Dictionary, position: Vector3, norma
 		return
 	var effect := SpellImpactEffectScript.new()
 	get_tree().current_scene.add_child(effect)
-	effect.initialize(_spell_from_dict(spell_data), position, normal, null)
+	effect.initialize(SpellNetworkCodecScript.from_dict(spell_data), position, normal, null)
 	effect.set_visual_only(true)
 
-
-func _spell_to_dict(spell: SpellDefinition) -> Dictionary:
-	return {
-		"spell_name": spell.spell_name,
-		"base_element": spell.base_element,
-		"base_weights": spell.get_base_weights(),
-		"shape": spell.shape,
-		"intensity": spell.intensity,
-		"spell_size": spell.spell_size,
-		"spell_range": spell.spell_range,
-		"spell_speed": spell.spell_speed,
-		"has_charging": spell.has_charging,
-		"burns": spell.burns,
-		"cools": spell.cools,
-		"pushes": spell.pushes,
-		"blows": spell.blows,
-		"heals": spell.heals,
-		"has_density": spell.has_density,
-		"density": spell.density,
-		"has_illusion": spell.has_illusion,
-		"has_pull": spell.has_pull,
-		"pull_strength": spell.pull_strength,
-	}
-
-
-func _spell_from_dict(data: Dictionary) -> SpellDefinition:
-	var spell := SpellDefinition.new()
-	spell.spell_name = str(data.get("spell_name", "Network Spell"))
-	spell.base_element = str(data.get("base_element", ""))
-	spell.base_weights = (data.get("base_weights", {}) as Dictionary).duplicate()
-	spell.shape = str(data.get("shape", "Sphere"))
-	spell.intensity = int(data.get("intensity", 1))
-	spell.spell_size = int(data.get("spell_size", 1))
-	spell.spell_range = int(data.get("spell_range", 1))
-	spell.spell_speed = int(data.get("spell_speed", 1))
-	spell.has_charging = bool(data.get("has_charging", false))
-	spell.burns = bool(data.get("burns", false))
-	spell.cools = bool(data.get("cools", false))
-	spell.pushes = bool(data.get("pushes", false))
-	spell.blows = bool(data.get("blows", false))
-	spell.heals = bool(data.get("heals", false))
-	spell.has_density = bool(data.get("has_density", false))
-	spell.density = int(data.get("density", 1))
-	spell.has_illusion = bool(data.get("has_illusion", false))
-	spell.has_pull = bool(data.get("has_pull", false))
-	spell.pull_strength = int(data.get("pull_strength", 1))
-	return spell
 
 
 func _spawn_push_test_target() -> void:

@@ -41,6 +41,7 @@ const ELEMENT_COLORS: Dictionary = {
 
 const SpellProjectileScene = preload("res://Scenes/SpellProjectile/SpellProjectile.tscn")
 const SpellImpactEffectScript = preload("res://Scripts/SpellImpactEffect.gd")
+const SpellNetworkCodecScript = preload("res://Scripts/SpellNetworkCodec.gd")
 
 var _head: Node3D
 var _camera: Camera3D
@@ -741,7 +742,7 @@ func _update_beam() -> void:
 
 	if has_hit and length >= target_length - 0.05 and _beam_impact_timer <= 0.0:
 		if _is_network_client():
-			_server_beam_tick.rpc_id(1, _spell_to_dict(_active_beam_spell), origin, direction)
+			_server_beam_tick.rpc_id(1, SpellNetworkCodecScript.to_dict(_active_beam_spell), origin, direction)
 		else:
 			_apply_spell_hit_to_collider(hit.get("collider"), _active_beam_spell, target, hit_normal, true)
 			_apply_push_recoil(_active_beam_spell, target, hit_normal, true)
@@ -789,14 +790,14 @@ func _spawn_spell_impact(spell: SpellDefinition, position: Vector3, normal: Vect
 func _cast_projectile_spell(spell: SpellDefinition, from: Vector3, direction: Vector3) -> void:
 	if _is_network_client():
 		_spawn_projectile_local(spell, from, direction, self)
-		_server_cast_projectile.rpc_id(1, _spell_to_dict(spell), from, direction, _network_time())
+		_server_cast_projectile.rpc_id(1, SpellNetworkCodecScript.to_dict(spell), from, direction, _network_time())
 		return
 	_spawn_projectile_for_all(spell, from, direction)
 
 
 func _cast_self_effect_spell(spell: SpellDefinition) -> void:
 	if _is_network_client():
-		_server_cast_self_effect.rpc_id(1, _spell_to_dict(spell))
+		_server_cast_self_effect.rpc_id(1, SpellNetworkCodecScript.to_dict(spell))
 		return
 	_apply_self_effect_for_all(spell)
 
@@ -805,21 +806,21 @@ func _cast_self_effect_spell(spell: SpellDefinition) -> void:
 func _server_cast_projectile(spell_data: Dictionary, from: Vector3, direction: Vector3, client_cast_time: float = -1.0) -> void:
 	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
 		return
-	_spawn_projectile_for_all(_spell_from_dict(spell_data), from, direction, client_cast_time)
+	_spawn_projectile_for_all(SpellNetworkCodecScript.from_dict(spell_data), from, direction, client_cast_time)
 
 
 @rpc("any_peer", "reliable")
 func _server_cast_self_effect(spell_data: Dictionary) -> void:
 	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
 		return
-	_apply_self_effect_for_all(_spell_from_dict(spell_data))
+	_apply_self_effect_for_all(SpellNetworkCodecScript.from_dict(spell_data))
 
 
 @rpc("any_peer", "reliable")
 func _server_beam_tick(spell_data: Dictionary, origin: Vector3, direction: Vector3) -> void:
 	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
 		return
-	var spell := _spell_from_dict(spell_data)
+	var spell := SpellNetworkCodecScript.from_dict(spell_data)
 	var max_distance := 7.0 + spell.spell_range * 3.0
 	var target := origin + direction.normalized() * max_distance
 	var query := PhysicsRayQueryParameters3D.create(origin, target)
@@ -842,7 +843,7 @@ func _spawn_projectile_for_all(spell: SpellDefinition, from: Vector3, direction:
 		if world != null and world.has_method("spawn_network_projectile"):
 			world.spawn_network_projectile(spell, from, direction, self, cast_server_time)
 			return
-		_client_spawn_projectile.rpc(_spell_to_dict(spell), from, direction, _network_peer_id)
+		_client_spawn_projectile.rpc(SpellNetworkCodecScript.to_dict(spell), from, direction, _network_peer_id)
 		return
 	_spawn_projectile_local(spell, from, direction, self)
 
@@ -850,7 +851,7 @@ func _spawn_projectile_for_all(spell: SpellDefinition, from: Vector3, direction:
 @rpc("any_peer", "call_local", "reliable")
 func _client_spawn_projectile(spell_data: Dictionary, from: Vector3, direction: Vector3, source_peer_id: int) -> void:
 	var source := _find_network_player(source_peer_id)
-	_spawn_projectile_local(_spell_from_dict(spell_data), from, direction, source)
+	_spawn_projectile_local(SpellNetworkCodecScript.from_dict(spell_data), from, direction, source)
 
 
 func _spawn_projectile_local(spell: SpellDefinition, from: Vector3, direction: Vector3, source: Node) -> void:
@@ -861,7 +862,7 @@ func _spawn_projectile_local(spell: SpellDefinition, from: Vector3, direction: V
 
 func _apply_self_effect_for_all(spell: SpellDefinition) -> void:
 	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
-		_client_apply_self_effect.rpc(_spell_to_dict(spell), _network_peer_id)
+		_client_apply_self_effect.rpc(SpellNetworkCodecScript.to_dict(spell), _network_peer_id)
 		return
 	_apply_self_effect_local(spell)
 
@@ -871,7 +872,7 @@ func _client_apply_self_effect(spell_data: Dictionary, source_peer_id: int) -> v
 	var player := _find_network_player(source_peer_id)
 	if player != self:
 		return
-	_apply_self_effect_local(_spell_from_dict(spell_data))
+	_apply_self_effect_local(SpellNetworkCodecScript.from_dict(spell_data))
 
 
 func _apply_self_effect_local(spell: SpellDefinition) -> void:
@@ -890,53 +891,6 @@ func _find_network_player(peer_id: int) -> Node:
 func _is_network_client() -> bool:
 	return multiplayer.multiplayer_peer != null and not multiplayer.is_server()
 
-
-func _spell_to_dict(spell: SpellDefinition) -> Dictionary:
-	return {
-		"spell_name": spell.spell_name,
-		"base_element": spell.base_element,
-		"base_weights": spell.get_base_weights(),
-		"shape": spell.shape,
-		"intensity": spell.intensity,
-		"spell_size": spell.spell_size,
-		"spell_range": spell.spell_range,
-		"spell_speed": spell.spell_speed,
-		"has_charging": spell.has_charging,
-		"burns": spell.burns,
-		"cools": spell.cools,
-		"pushes": spell.pushes,
-		"blows": spell.blows,
-		"heals": spell.heals,
-		"has_density": spell.has_density,
-		"density": spell.density,
-		"has_illusion": spell.has_illusion,
-		"has_pull": spell.has_pull,
-		"pull_strength": spell.pull_strength,
-	}
-
-
-func _spell_from_dict(data: Dictionary) -> SpellDefinition:
-	var spell := SpellDefinition.new()
-	spell.spell_name = str(data.get("spell_name", "Network Spell"))
-	spell.base_element = str(data.get("base_element", ""))
-	spell.base_weights = (data.get("base_weights", {}) as Dictionary).duplicate()
-	spell.shape = str(data.get("shape", "Sphere"))
-	spell.intensity = int(data.get("intensity", 1))
-	spell.spell_size = int(data.get("spell_size", 1))
-	spell.spell_range = int(data.get("spell_range", 1))
-	spell.spell_speed = int(data.get("spell_speed", 1))
-	spell.has_charging = bool(data.get("has_charging", false))
-	spell.burns = bool(data.get("burns", false))
-	spell.cools = bool(data.get("cools", false))
-	spell.pushes = bool(data.get("pushes", false))
-	spell.blows = bool(data.get("blows", false))
-	spell.heals = bool(data.get("heals", false))
-	spell.has_density = bool(data.get("has_density", false))
-	spell.density = int(data.get("density", 1))
-	spell.has_illusion = bool(data.get("has_illusion", false))
-	spell.has_pull = bool(data.get("has_pull", false))
-	spell.pull_strength = int(data.get("pull_strength", 1))
-	return spell
 
 
 func _apply_spell_hit_to_collider(collider: Object, spell: SpellDefinition, hit_position: Vector3, hit_normal: Vector3, is_beam_tick: bool) -> bool:
