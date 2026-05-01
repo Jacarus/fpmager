@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://spell_projectile"]
+
+[ext_resource type="Script" path="res://Scenes/SpellProjectile/SpellProjectile.gd" id="1_proj_script"]
+
+[node name="SpellProjectile" type="Node3D"]
+script = ExtResource("1_proj_script")

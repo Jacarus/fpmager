@@ -1,0 +1,37 @@
+# Fly.io app configuration for FP Mager dedicated game server.
+#
+# IMPORTANT — UDP requires a dedicated IPv4 address.
+# Run once after `fly launch`:
+#   fly ips allocate-v4 --app fp-mager
+#
+# Then deploy:
+#   fly deploy
+
+app = "fp-mager"
+primary_region = "syd"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT           = "24567"
+  BOTS           = "true"
+  BOT_COUNT      = "3"
+  BOT_DIFFICULTY = "Medium"
+  SERVER_COMMAND_FILE = "/tmp/fp-mager-commands.txt"
+  PUBLIC_IP      = "149.248.209.141"
+
+# ENet UDP game port.
+[[services]]
+  protocol             = "udp"
+  internal_port        = 24567
+  auto_stop_machines   = "off"
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 24567
+
+[[vm]]
+  memory   = "256mb"
+  cpu_kind = "shared"
+  cpus     = 1

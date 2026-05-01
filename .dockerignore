@@ -1,0 +1,15 @@
+.godot/
+Scenes/
+Scripts/
+Docs/
+*.gd
+*.tscn
+*.tres
+*.import
+*.md
+*.cfg
+export_presets.cfg
+project.godot
+icon.svg
+fly.toml
+scripts/

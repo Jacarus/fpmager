@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://basic_caster"]
+
+[ext_resource type="Script" path="res://Scenes/NPC/BasicCaster.gd" id="1_basic_caster"]
+
+[node name="BasicCaster" type="CharacterBody3D"]
+script = ExtResource("1_basic_caster")
