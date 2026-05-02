@@ -2,12 +2,27 @@ extends Node3D
 
 const PlayerScene = preload("res://Scenes/Player/Player.tscn")
 const BasicCasterScene = preload("res://Scenes/NPC/BasicCaster.tscn")
+const BeamTestCasterScene = preload("res://Scenes/NPC/BeamTestCaster.tscn")
 const SpellProjectileScene = preload("res://Scenes/SpellProjectile/SpellProjectile.tscn")
 const SpellImpactEffectScript = preload("res://Scripts/SpellImpactEffect.gd")
 const SpellCreationScene = preload("res://Scenes/SpellCreation/SpellCreationUI.tscn")
 const PushTestTargetScript = preload("res://Scenes/World/PushTestTarget.gd")
 const SpellNetworkCodecScript = preload("res://Scripts/SpellNetworkCodec.gd")
 const PLAYER_LOADOUT_CREDIT_LIMIT := 120
+const BEAM_COLLISION_RADIUS_BASE := 0.08
+const BEAM_COLLISION_RADIUS_SIZE_SCALE := 0.045
+const BEAM_COLLISION_IMPACT_INTERVAL := 0.35
+const BEAM_CLASH_MAX_PUSH_FRACTION := 0.72
+const BEAM_CLASH_SMOOTHING := 0.28
+const BASE_PROPERTIES := {
+	"Fire": {"temperature": 10, "density": 2, "opposing": ["Water", "Void"]},
+	"Water": {"temperature": 2, "density": 6, "opposing": ["Fire", "Void"]},
+	"Air": {"temperature": 4, "density": 1, "opposing": ["Earth"]},
+	"Spirit": {"temperature": 5, "density": 0, "opposing": ["Void"]},
+	"Earth": {"temperature": 3, "density": 10, "opposing": ["Air"]},
+	"Light": {"temperature": 6, "density": 0, "opposing": ["Void"]},
+	"Void": {"temperature": 0, "density": -10, "opposing": ["Light", "Spirit", "Fire", "Water"]},
+}
 const PLAYER_COLORS: Array[Color] = [
 	Color(0.2, 0.48, 1.0),
 	Color(1.0, 0.28, 0.22),
@@ -26,6 +41,10 @@ var _peers_in_creator: Dictionary = {}
 var _active_spell_impacts: Array[Dictionary] = []
 var _next_spell_impact_id: int = 1
 var _predicted_projectile_echoes: Array[Dictionary] = []
+var _active_beam_segments: Dictionary = {}
+var _beam_collision_impacts: Dictionary = {}
+var _beam_clash_points: Dictionary = {}
+var _beam_test_caster: Node3D
 
 
 func _ready() -> void:
@@ -42,6 +61,7 @@ func _ready() -> void:
 		_spawn_single_player()
 		_spawn_configured_bots()
 	_spawn_push_test_target()
+	_spawn_beam_test_caster()
 
 
 func _process(_delta: float) -> void:
@@ -49,6 +69,7 @@ func _process(_delta: float) -> void:
 		_prune_expired_spell_impacts()
 	else:
 		_prune_predicted_projectile_echoes()
+	_prune_stale_beam_segments()
 
 
 func _setup_multiplayer_world() -> void:
@@ -161,6 +182,8 @@ func _request_world_state() -> void:
 				caster.get_spell_loadout_data() if caster.has_method("get_spell_loadout_data") else [],
 				caster.get_difficulty_data() if caster.has_method("get_difficulty_data") else _get_bot_difficulty_data()
 			)
+	if _beam_test_caster != null:
+		_spawn_beam_test_caster_for_all.rpc_id(peer_id, _beam_test_caster.global_position)
 	_send_active_spell_impacts(peer_id)
 	if not _players.has(peer_id):
 		var spawn_position := _get_spawn_position(_players.size())
@@ -195,6 +218,7 @@ func _despawn_player_for_peer(peer_id: int) -> void:
 	var player := _players.get(peer_id) as Node
 	if player != null:
 		player.queue_free()
+	unregister_beam_segment("player:%d" % peer_id)
 	_players.erase(peer_id)
 	if _player == player:
 		_player = null
@@ -326,6 +350,32 @@ func _despawn_basic_caster_local(bot_id: int) -> void:
 				_basic_caster = existing
 				break
 	_refresh_basic_caster_target()
+
+
+func _spawn_beam_test_caster() -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server():
+		return
+	var pos := Vector3(-11.0, 0.0, -2.0)
+	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
+		_spawn_beam_test_caster_for_all.rpc(pos)
+	else:
+		_spawn_beam_test_caster_local(pos)
+
+
+@rpc("any_peer", "call_local", "reliable")
+func _spawn_beam_test_caster_for_all(spawn_position: Vector3) -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+		return
+	_spawn_beam_test_caster_local(spawn_position)
+
+
+func _spawn_beam_test_caster_local(spawn_position: Vector3) -> void:
+	if _beam_test_caster != null:
+		return
+	_beam_test_caster = BeamTestCasterScene.instantiate()
+	_beam_test_caster.name = "BeamTestCaster"
+	_beam_test_caster.position = spawn_position
+	add_child(_beam_test_caster)
 
 
 func _update_existing_bot_difficulty() -> void:
@@ -648,6 +698,343 @@ func _get_projectile_prediction_spell_key(spell: SpellDefinition) -> String:
 		spell.spell_range,
 		spell.spell_speed,
 	]
+
+
+func resolve_beam_segment(source_key: String, spell: SpellDefinition, origin: Vector3, raw_target: Vector3, source: Node = null) -> Dictionary:
+	if spell == null:
+		return {"target": raw_target, "blocked": false}
+	var now := Time.get_ticks_msec() / 1000.0
+	var segment := {
+		"source_key": source_key,
+		"spell": spell,
+		"origin": origin,
+		"raw_target": raw_target,
+		"target": raw_target,
+		"source": source,
+		"updated_at": now,
+	}
+	_active_beam_segments[source_key] = segment
+
+	var best_t := 2.0
+	var clipped_target := raw_target
+	var blocked := false
+	for other_key in _active_beam_segments.keys():
+		var other_source_key := str(other_key)
+		if other_source_key == source_key:
+			continue
+		var other := _active_beam_segments[other_key] as Dictionary
+		if other.is_empty() or now - float(other.get("updated_at", 0.0)) > 0.25:
+			continue
+		var other_spell := other.get("spell") as SpellDefinition
+		if other_spell == null:
+			continue
+		var other_origin := other["origin"] as Vector3
+		var other_raw_target := other["raw_target"] as Vector3
+		var closest := _get_closest_segment_points(origin, raw_target, other_origin, other_raw_target)
+		var collision_radius := _get_beam_collision_radius(spell) + _get_beam_collision_radius(other_spell)
+		if float(closest["distance"]) > collision_radius:
+			continue
+
+		var t_self := float(closest["t_a"])
+		var t_other := float(closest["t_b"])
+		var collision_point: Vector3 = (closest["point_a"] as Vector3).lerp(closest["point_b"] as Vector3, 0.5)
+		var direction := (raw_target - origin).normalized()
+		var other_direction := (other_raw_target - other_origin).normalized()
+		var outcome := _resolve_beam_collision(spell, other_spell, direction, other_direction)
+		var pair_key := _get_beam_pair_key(source_key, other_source_key)
+		var clash_point := _get_pushed_beam_clash_point(
+			pair_key,
+			collision_point,
+			origin,
+			raw_target,
+			t_self,
+			other_origin,
+			other_raw_target,
+			t_other,
+			float(outcome.get("clash_bias", 0.0))
+		)
+		var impact_spell := outcome.get("reaction_spell") as SpellDefinition
+		if impact_spell == null:
+			impact_spell = spell
+		_maybe_spawn_beam_collision_impact(source_key, other_source_key, impact_spell, clash_point, -direction)
+
+		if bool(outcome.get("block_b", false)):
+			var other_target := clash_point
+			if other_origin.distance_to(other_target) < other_origin.distance_to(other.get("target", other_raw_target)):
+				other["target"] = other_target
+				other["blocked"] = true
+				_active_beam_segments[other_key] = other
+		if bool(outcome.get("block_a", false)) and t_self < best_t:
+			best_t = t_self
+			clipped_target = clash_point
+			blocked = true
+
+	segment["target"] = clipped_target
+	segment["blocked"] = blocked
+	_active_beam_segments[source_key] = segment
+	return {"target": clipped_target, "blocked": blocked}
+
+
+func get_registered_beam_target(source_key: String, fallback: Vector3) -> Vector3:
+	var segment := _active_beam_segments.get(source_key, {}) as Dictionary
+	if segment.is_empty():
+		return fallback
+	return segment.get("target", fallback) as Vector3
+
+
+func unregister_beam_segment(source_key: String) -> void:
+	_active_beam_segments.erase(source_key)
+
+
+func _resolve_beam_collision(a: SpellDefinition, b: SpellDefinition, direction_a: Vector3, direction_b: Vector3) -> Dictionary:
+	var opposing_pair := _find_opposing_pair(a, b)
+	if not opposing_pair.is_empty():
+		var power_a := _get_opposition_power(a, opposing_pair[0])
+		var power_b := _get_opposition_power(b, opposing_pair[1])
+		var high_power: float = maxf(power_a, power_b)
+		if _is_steam_reaction(opposing_pair):
+			return {
+				"block_a": true,
+				"block_b": true,
+				"clash_bias": _get_power_bias(power_a, power_b),
+				"reaction_spell": _create_reaction_spell(a, b, opposing_pair, 1.75),
+			}
+		var interference := _get_wave_interference(a, b, direction_a, direction_b)
+		var cancel_strength := _get_cancel_strength(interference)
+		var effective_a := power_a * (0.65 + cancel_strength * 0.7)
+		var effective_b := power_b * (0.65 + cancel_strength * 0.7)
+		var reaction_spell := _create_reaction_spell(a, b, opposing_pair)
+		if high_power <= 0.0:
+			return {"block_a": true, "block_b": true, "reaction_spell": reaction_spell}
+		return {
+			"block_a": true,
+			"block_b": true,
+			"clash_bias": _get_power_bias(effective_a, effective_b),
+			"reaction_spell": reaction_spell,
+		}
+
+	if a.get_dominant_base() == b.get_dominant_base():
+		var total_a := _get_total_power(a)
+		var total_b := _get_total_power(b)
+		var interference := _get_wave_interference(a, b, direction_a, direction_b)
+		var high_power: float = maxf(total_a, total_b)
+		if interference >= 0.35:
+			return {"block_a": false, "block_b": false}
+		if high_power <= 0.0 or interference <= -0.35 and absf(total_a - total_b) / high_power <= 0.25:
+			return {"block_a": true, "block_b": true}
+		if interference <= -0.35:
+			return {"block_a": true, "block_b": true, "clash_bias": _get_power_bias(total_a, total_b)}
+		return {"block_a": true, "block_b": true, "clash_bias": _get_power_bias(total_a, total_b) * 0.45}
+
+	var density_a := _get_spell_density(a)
+	var density_b := _get_spell_density(b)
+	var density_delta := absf(density_a - density_b)
+	if density_delta > 6.0:
+		return {"block_a": true, "block_b": true, "clash_bias": _get_power_bias(density_a, density_b)}
+	var temp_delta := absf(_get_spell_temperature(a) - _get_spell_temperature(b))
+	var interference := _get_wave_interference(a, b, direction_a, direction_b)
+	if temp_delta > 6.0:
+		return {"block_a": true, "block_b": true, "clash_bias": _get_power_bias(_get_total_power(a), _get_total_power(b)) * 0.65}
+	if interference > 0.55:
+		return {"block_a": false, "block_b": false}
+	return {"block_a": true, "block_b": true, "clash_bias": _get_power_bias(_get_total_power(a), _get_total_power(b)) * 0.35}
+
+
+func _get_beam_pair_key(source_a: String, source_b: String) -> String:
+	var keys := [source_a, source_b]
+	keys.sort()
+	return "%s|%s" % [keys[0], keys[1]]
+
+
+func _get_pushed_beam_clash_point(
+	pair_key: String,
+	collision_point: Vector3,
+	origin_a: Vector3,
+	target_a: Vector3,
+	t_a: float,
+	origin_b: Vector3,
+	target_b: Vector3,
+	t_b: float,
+	clash_bias: float
+) -> Vector3:
+	var desired := collision_point
+	var bias := clampf(clash_bias, -1.0, 1.0)
+	var push := absf(bias) * BEAM_CLASH_MAX_PUSH_FRACTION
+	if push > 0.01:
+		if bias > 0.0:
+			var pushed_t := lerpf(t_b, 0.03, push)
+			desired = origin_b.lerp(target_b, clampf(pushed_t, 0.0, 1.0))
+		else:
+			var pushed_t := lerpf(t_a, 0.03, push)
+			desired = origin_a.lerp(target_a, clampf(pushed_t, 0.0, 1.0))
+	var previous := _beam_clash_points.get(pair_key, desired) as Vector3
+	var smoothed := previous.lerp(desired, BEAM_CLASH_SMOOTHING)
+	_beam_clash_points[pair_key] = smoothed
+	return smoothed
+
+
+func _get_power_bias(power_a: float, power_b: float) -> float:
+	var high_power: float = maxf(absf(power_a), absf(power_b))
+	if high_power <= 0.001:
+		return 0.0
+	return clampf((power_a - power_b) / high_power, -1.0, 1.0)
+
+
+func _is_steam_reaction(opposing_pair: Array[String]) -> bool:
+	return opposing_pair.has("Fire") and opposing_pair.has("Water")
+
+
+func _maybe_spawn_beam_collision_impact(source_a: String, source_b: String, spell: SpellDefinition, position: Vector3, normal: Vector3) -> void:
+	var pair_key := _get_beam_pair_key(source_a, source_b)
+	var now := Time.get_ticks_msec() / 1000.0
+	if now - float(_beam_collision_impacts.get(pair_key, -99.0)) < BEAM_COLLISION_IMPACT_INTERVAL:
+		return
+	_beam_collision_impacts[pair_key] = now
+	var effect := SpellImpactEffectScript.new()
+	get_tree().current_scene.add_child(effect)
+	effect.initialize(spell, position, normal, null)
+	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
+		broadcast_spell_impact(spell, position, normal)
+
+
+func _prune_stale_beam_segments() -> void:
+	var now := Time.get_ticks_msec() / 1000.0
+	for key in _active_beam_segments.keys():
+		var segment := _active_beam_segments[key] as Dictionary
+		if now - float(segment.get("updated_at", 0.0)) > 0.5:
+			_active_beam_segments.erase(key)
+	for key in _beam_collision_impacts.keys():
+		if now - float(_beam_collision_impacts[key]) > 2.0:
+			_beam_collision_impacts.erase(key)
+	for key in _beam_clash_points.keys():
+		var key_text := str(key)
+		var parts := key_text.split("|", false)
+		if parts.size() != 2 or not _active_beam_segments.has(parts[0]) or not _active_beam_segments.has(parts[1]):
+			_beam_clash_points.erase(key)
+
+
+func _get_beam_collision_radius(spell: SpellDefinition) -> float:
+	return BEAM_COLLISION_RADIUS_BASE + float(spell.spell_size) * BEAM_COLLISION_RADIUS_SIZE_SCALE
+
+
+func _get_closest_segment_points(a0: Vector3, a1: Vector3, b0: Vector3, b1: Vector3) -> Dictionary:
+	var u := a1 - a0
+	var v := b1 - b0
+	var w := a0 - b0
+	var a := u.dot(u)
+	var b := u.dot(v)
+	var c := v.dot(v)
+	var d := u.dot(w)
+	var e := v.dot(w)
+	var denominator := a * c - b * b
+	var sc := 0.0
+	var tc := 0.0
+	if denominator > 0.0001:
+		sc = clampf((b * e - c * d) / denominator, 0.0, 1.0)
+	if c > 0.0001:
+		tc = clampf((b * sc + e) / c, 0.0, 1.0)
+	if a > 0.0001:
+		sc = clampf((b * tc - d) / a, 0.0, 1.0)
+	var point_a := a0 + u * sc
+	var point_b := b0 + v * tc
+	return {
+		"point_a": point_a,
+		"point_b": point_b,
+		"t_a": sc,
+		"t_b": tc,
+		"distance": point_a.distance_to(point_b),
+	}
+
+
+func _find_opposing_pair(a: SpellDefinition, b: SpellDefinition) -> Array[String]:
+	for base_a in a.get_base_elements():
+		for base_b in b.get_base_elements():
+			var props: Dictionary = BASE_PROPERTIES.get(base_a, {})
+			var opposing: Array = props.get("opposing", [])
+			if opposing.has(base_b):
+				return [base_a, base_b]
+	return []
+
+
+func _get_opposition_power(spell: SpellDefinition, base: String) -> float:
+	var weights := spell.get_base_weights()
+	var weight := float(weights.get(base, 0)) / 100.0
+	return weight * float(spell.intensity) * float(spell.spell_size)
+
+
+func _get_total_power(spell: SpellDefinition) -> float:
+	return float(spell.intensity) * float(spell.spell_size)
+
+
+func _get_spell_temperature(spell: SpellDefinition) -> float:
+	return _get_weighted_base_property(spell, "temperature", 5.0)
+
+
+func _get_spell_density(spell: SpellDefinition) -> float:
+	return _get_weighted_base_property(spell, "density", 1.0)
+
+
+func _get_weighted_base_property(spell: SpellDefinition, property: String, fallback: float) -> float:
+	var weights := spell.get_base_weights()
+	var total := 0.0
+	var value := 0.0
+	for base in weights.keys():
+		var weight := float(weights[base])
+		total += weight
+		var props: Dictionary = BASE_PROPERTIES.get(str(base), {})
+		value += float(props.get(property, fallback)) * weight
+	if total <= 0.0:
+		return fallback
+	return value / total
+
+
+func _get_wave_interference(a: SpellDefinition, b: SpellDefinition, direction_a: Vector3, direction_b: Vector3) -> float:
+	var phase_delta: float = _get_wave_phase(a) - _get_wave_phase(b)
+	var phase_alignment := cos(phase_delta)
+	var direction_alignment := direction_a.normalized().dot(direction_b.normalized())
+	var aim_factor: float = clampf((1.0 - direction_alignment) * 0.5, 0.0, 1.0)
+	return clampf(phase_alignment * 0.75 - aim_factor * 0.35, -1.0, 1.0)
+
+
+func _get_cancel_strength(interference: float) -> float:
+	return clampf(-interference, 0.0, 1.0)
+
+
+func _get_wave_phase(spell: SpellDefinition) -> float:
+	var lifetime := Time.get_ticks_msec() / 1000.0
+	return _get_base_phase_offset(spell.get_dominant_base()) + lifetime * _get_wave_frequency(spell) * TAU
+
+
+func _get_wave_frequency(spell: SpellDefinition) -> float:
+	return 0.65 + spell.spell_speed * 0.08 + spell.intensity * 0.035 + spell.get_base_elements().size() * 0.06
+
+
+func _get_base_phase_offset(base: String) -> float:
+	match base:
+		"Fire": return 0.0
+		"Water": return PI
+		"Air": return PI * 0.33
+		"Earth": return PI * 1.33
+		"Spirit": return PI * 0.72
+		"Light": return PI * 0.18
+		"Void": return PI * 1.18
+		_: return 0.0
+
+
+func _create_reaction_spell(a: SpellDefinition, b: SpellDefinition, opposing_pair: Array[String], strength_scale: float = 1.0) -> SpellDefinition:
+	var spell := SpellDefinition.new()
+	spell.spell_name = "Steam Clash" if _is_steam_reaction(opposing_pair) else "Beam Clash"
+	spell.base_element = opposing_pair[0]
+	spell.base_weights = {opposing_pair[0]: 50, opposing_pair[1]: 50}
+	spell.shape = "Sphere"
+	spell.intensity = max(1, int(round((a.intensity + b.intensity) * 0.5 * strength_scale)))
+	spell.spell_size = max(1, int(round((a.spell_size + b.spell_size) * 0.5 * strength_scale)))
+	spell.spell_range = 1
+	spell.spell_speed = 1
+	if _is_steam_reaction(opposing_pair):
+		spell.burns = true
+		spell.cools = true
+	return spell
 
 
 func broadcast_spell_impact(spell: SpellDefinition, position: Vector3, normal: Vector3) -> void:
