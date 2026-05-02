@@ -128,6 +128,16 @@ Online multiplayer uses Godot ENet networking.
     -Beam visuals are replicated separately from beam damage. The casting player draws
      their beam immediately, while the server relays visual-only beam start/update/stop
      messages to the other peers.
+    -Active beams are registered as server-side spell segments. When beam segments
+     cross, the server compares their base components, opposition, density,
+     temperature, and waveform interference to decide whether one beam wins or both
+     cancel at the collision point.
+    -Beam collision uses a size-based overlap radius, so beams start a struggle when
+     their active beam bodies cross paths. Most clashes stop both beams at a shared
+     pressure point, and stronger beams push that point toward the weaker caster
+     instead of instantly passing through.
+    -Fire/Water beam clashes stop both beams and create a larger Steam Clash cloud at
+     the collision point.
 
 ##Spell creation##
 UI should dynamically update to show what the spell will look like in the characters hands / body (i.e. growing larger as its size is increased)

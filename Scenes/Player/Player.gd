@@ -91,6 +91,9 @@ var _beam_impact_timer: float = 0.0
 var _beam_core: MeshInstance3D
 var _beam_tip: MeshInstance3D
 var _beam_light: OmniLight3D
+var _server_beam_origin: Vector3
+var _server_beam_target: Vector3
+var _server_beam_correction_time: float = -1.0
 var _remote_beam: Node3D
 var _remote_beam_spell: SpellDefinition
 var _remote_beam_core: MeshInstance3D
@@ -768,6 +771,10 @@ func _stop_beam() -> void:
 	_beam_core = null
 	_beam_tip = null
 	_beam_light = null
+	_server_beam_correction_time = -1.0
+	var world := get_tree().current_scene
+	if world != null and world.has_method("unregister_beam_segment"):
+		world.unregister_beam_segment(_get_beam_source_key())
 	_broadcast_beam_stop()
 
 
@@ -795,6 +802,17 @@ func _update_beam() -> void:
 	_beam_visible_length = move_toward(_beam_visible_length, target_length, propagation_speed * get_physics_process_delta_time())
 	var length: float = minf(target_length, maxf(0.1, _beam_visible_length))
 	var visible_target: Vector3 = origin + direction * length
+	var beam_blocked_by_spell := false
+	var world := get_tree().current_scene
+	if world != null and world.has_method("resolve_beam_segment") and not _is_network_client():
+		var beam_result: Dictionary = world.resolve_beam_segment(_get_beam_source_key(), _active_beam_spell, origin, visible_target, self)
+		visible_target = beam_result.get("target", visible_target) as Vector3
+		beam_blocked_by_spell = bool(beam_result.get("blocked", false))
+		length = maxf(0.1, origin.distance_to(visible_target))
+	elif _is_network_client() and _network_time() - _server_beam_correction_time < 0.12 and origin.distance_to(_server_beam_origin) < 1.2:
+		visible_target = _server_beam_target
+		beam_blocked_by_spell = origin.distance_to(visible_target) + 0.05 < target_length
+		length = maxf(0.1, origin.distance_to(visible_target))
 	var midpoint: Vector3 = origin.lerp(visible_target, 0.5)
 	var thickness: float = 0.08 + (_active_beam_spell.spell_size - 1) * 0.025
 
@@ -815,7 +833,7 @@ func _update_beam() -> void:
 	_beam_light.global_position = visible_target
 	_broadcast_beam_update(origin, visible_target)
 
-	if has_hit and length >= target_length - 0.05 and _beam_impact_timer <= 0.0:
+	if has_hit and not beam_blocked_by_spell and length >= target_length - 0.05 and _beam_impact_timer <= 0.0:
 		if _is_network_client():
 			_server_beam_tick.rpc_id(1, SpellNetworkCodecScript.to_dict(_active_beam_spell), origin, direction)
 		else:
@@ -841,6 +859,10 @@ func _get_beam_propagation_speed(spell_speed: int) -> float:
 	return 1.8 + pow(float(spell_speed), 1.55) * 2.1
 
 
+func _get_beam_source_key() -> String:
+	return "player:%d" % _network_peer_id
+
+
 func _broadcast_beam_start(spell: SpellDefinition) -> void:
 	if multiplayer.multiplayer_peer == null:
 		return
@@ -855,7 +877,7 @@ func _broadcast_beam_update(origin: Vector3, target: Vector3) -> void:
 	if multiplayer.multiplayer_peer == null:
 		return
 	if multiplayer.is_server():
-		_client_update_beam_visual.rpc(origin, target, _network_peer_id)
+		_client_update_beam_visual.rpc(origin, target, _network_peer_id, false)
 	else:
 		_server_update_beam_visual.rpc_id(1, origin, target)
 
@@ -881,14 +903,24 @@ func _server_start_beam_visual(spell_data: Dictionary) -> void:
 func _server_update_beam_visual(origin: Vector3, target: Vector3) -> void:
 	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
 		return
-	_client_update_beam_visual.rpc(origin, target, _network_peer_id)
-	_update_remote_beam_visual(origin, target)
+	var broadcast_target := target
+	var broadcast_blocked := false
+	var world := get_tree().current_scene
+	if world != null and world.has_method("resolve_beam_segment") and _remote_beam_spell != null:
+		var beam_result: Dictionary = world.resolve_beam_segment(_get_beam_source_key(), _remote_beam_spell, origin, target, self)
+		broadcast_target = beam_result.get("target", target) as Vector3
+		broadcast_blocked = bool(beam_result.get("blocked", false))
+	_client_update_beam_visual.rpc(origin, broadcast_target, _network_peer_id, broadcast_blocked)
+	_update_remote_beam_visual(origin, broadcast_target)
 
 
 @rpc("any_peer", "reliable")
 func _server_stop_beam_visual() -> void:
 	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
 		return
+	var world := get_tree().current_scene
+	if world != null and world.has_method("unregister_beam_segment"):
+		world.unregister_beam_segment(_get_beam_source_key())
 	_client_stop_beam_visual.rpc(_network_peer_id)
 	_stop_remote_beam_visual()
 
@@ -903,10 +935,14 @@ func _client_start_beam_visual(spell_data: Dictionary, source_peer_id: int) -> v
 
 
 @rpc("any_peer", "unreliable")
-func _client_update_beam_visual(origin: Vector3, target: Vector3, source_peer_id: int) -> void:
+func _client_update_beam_visual(origin: Vector3, target: Vector3, source_peer_id: int, source_blocked: bool = false) -> void:
 	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
 		return
 	if source_peer_id == multiplayer.get_unique_id():
+		if source_blocked:
+			_server_beam_origin = origin
+			_server_beam_target = target
+			_server_beam_correction_time = _network_time()
 		return
 	_update_remote_beam_visual(origin, target)
 
@@ -1074,6 +1110,11 @@ func _server_beam_tick(spell_data: Dictionary, origin: Vector3, direction: Vecto
 		return
 	var hit_position := hit["position"] as Vector3
 	var hit_normal := hit["normal"] as Vector3
+	var world := get_tree().current_scene
+	if world != null and world.has_method("get_registered_beam_target"):
+		var beam_target: Vector3 = world.get_registered_beam_target(_get_beam_source_key(), hit_position)
+		if origin.distance_to(beam_target) + 0.05 < origin.distance_to(hit_position):
+			return
 	_apply_spell_hit_to_collider(hit.get("collider"), spell, hit_position, hit_normal, true)
 	_apply_push_recoil(spell, hit_position, hit_normal, true)
 	_spawn_spell_impact(spell, hit_position, hit_normal)
