@@ -9,6 +9,10 @@ const MAX_MANA := 100.0
 const MAX_HEALTH := 100
 const RESPAWN_DELAY := 2.5
 const MANA_REGEN_PER_SECOND := 14.0
+const FALL_DAMAGE_SAFE_HEIGHT := 5.0
+const FALL_DAMAGE_PER_METER := 18.0
+const HARD_LANDING_MOMENTUM_CANCEL_HEIGHT := 3.0
+const FALL_LANDING_VELOCITY_EPSILON := 0.2
 const BEAM_MANA_TICK_MINIMUM := 0.35
 const SPHERE_MAX_CHARGE_TIME := 2.5
 const SPHERE_MAX_CHARGE_SIZE_BONUS := 5
@@ -55,6 +59,7 @@ var _mana_label: Label
 var _hint_label: Label
 var _blind_overlay: ColorRect
 var _pause_overlay: CanvasLayer
+var _fullscreen_btn: Button
 var _spells: Array[SpellDefinition] = []
 var _active_index: int = 0
 var _loadout_slots: Array[SpellDefinition] = []
@@ -71,6 +76,14 @@ var _is_dead: bool = false
 var _respawn_timer: float = 0.0
 var _kill_zone_respawn_timer: float = -1.0
 var _respawn_position: Vector3
+var _was_on_floor_last_frame: bool = true
+var _fall_peak_y: float = 0.0
+var _server_was_falling: bool = false
+var _server_fall_peak_y: float = 0.0
+var _server_previous_pos: Vector3
+var _server_previous_velocity: Vector3 = Vector3.ZERO
+var _server_has_previous_motion: bool = false
+var _jump_was_pressed_last_frame: bool = false
 var _active_beam: Node3D
 var _active_beam_spell: SpellDefinition
 var _beam_visible_length: float = 0.0
@@ -78,6 +91,14 @@ var _beam_impact_timer: float = 0.0
 var _beam_core: MeshInstance3D
 var _beam_tip: MeshInstance3D
 var _beam_light: OmniLight3D
+var _remote_beam: Node3D
+var _remote_beam_spell: SpellDefinition
+var _remote_beam_core: MeshInstance3D
+var _remote_beam_tip: MeshInstance3D
+var _remote_beam_light: OmniLight3D
+var _remote_beam_origin: Vector3
+var _remote_beam_target: Vector3
+var _remote_beam_last_update_time: float = 0.0
 var _charging_sphere_spell: SpellDefinition
 var _charging_sphere_time: float = 0.0
 var _charging_sphere_paid_size: int = 0
@@ -118,9 +139,18 @@ func _ready() -> void:
 	_respawn_position = global_position
 	if _is_local_player:
 		Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+	_was_on_floor_last_frame = is_on_floor()
+	_fall_peak_y = global_position.y
+	_server_previous_pos = global_position
+	_server_fall_peak_y = global_position.y
 
 
 func _notification(what: int) -> void:
+	if what == NOTIFICATION_PREDELETE:
+		_stop_remote_beam_visual()
+		if _active_beam != null:
+			_active_beam.queue_free()
+		return
 	if not _is_local_player:
 		return
 	if what == NOTIFICATION_APPLICATION_FOCUS_OUT:
@@ -133,8 +163,18 @@ func _notification(what: int) -> void:
 
 
 func _process(delta: float) -> void:
+	_tick_remote_beam_visual()
 	if not _is_local_player:
 		_update_remote_visual_transform(delta)
+
+
+func _tick_remote_beam_visual() -> void:
+	if _remote_beam == null:
+		return
+	if _network_time() - _remote_beam_last_update_time > 0.6:
+		_stop_remote_beam_visual()
+		return
+	_apply_remote_beam_transform()
 
 
 func _build_body() -> void:
@@ -287,7 +327,7 @@ func _build_hud() -> void:
 	_hint_label.offset_top = 12.0
 	_hint_label.offset_right = -16.0
 	_hint_label.offset_bottom = 32.0
-	_hint_label.text = "WASD: Move   Space: Jump   LMB/RMB/Shift: Cast slots   Scroll: Browse spells   1/2/3: Assign browsed spell   ESC: Menu"
+	_hint_label.text = "WASD: Move   Space: Jump   LMB/RMB/Shift: Cast slots   Scroll: Browse spells   1/2/3: Assign browsed spell   ESC: Menu   F11: Fullscreen"
 	_hint_label.add_theme_font_size_override("font_size", 12)
 	_hint_label.add_theme_color_override("font_color", Color(0.8, 0.8, 0.8, 0.6))
 
@@ -337,6 +377,13 @@ func _build_pause_overlay() -> void:
 	spell_creator_btn.text = "Spell Creator"
 	spell_creator_btn.pressed.connect(_go_to_spell_creator)
 	vbox.add_child(spell_creator_btn)
+
+	_fullscreen_btn = Button.new()
+	_update_fullscreen_button()
+	_fullscreen_btn.pressed.connect(GameSettings.toggle_fullscreen)
+	vbox.add_child(_fullscreen_btn)
+	if not GameSettings.fullscreen_changed.is_connected(_on_fullscreen_changed):
+		GameSettings.fullscreen_changed.connect(_on_fullscreen_changed)
 
 	var main_menu_btn := Button.new()
 	main_menu_btn.text = "Main Menu"
@@ -445,6 +492,8 @@ func _unhandled_input(event: InputEvent) -> void:
 				_cancel_charged_sphere()
 				_stop_beam()
 				_toggle_pause()
+			KEY_F11:
+				GameSettings.toggle_fullscreen()
 			KEY_SHIFT:
 				_try_cast_slot(2)
 			KEY_1, KEY_2, KEY_3:
@@ -467,6 +516,16 @@ func _toggle_pause() -> void:
 func _on_resume() -> void:
 	_pause_overlay.visible = false
 	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+
+
+func _on_fullscreen_changed(_enabled: bool) -> void:
+	_update_fullscreen_button()
+
+
+func _update_fullscreen_button() -> void:
+	if _fullscreen_btn == null:
+		return
+	_fullscreen_btn.text = "Windowed" if GameSettings.is_fullscreen() else "Fullscreen"
 
 
 func _go_to_spell_creator() -> void:
@@ -628,10 +687,11 @@ func _try_cast_slot(slot_index: int) -> void:
 		_start_beam(spell)
 		return
 	if spell.is_healing_spell() and not (spell.shape == "Sphere" and spell.has_charging):
-		if not _spend_mana(spell.calculate_mana_cost()):
+		var mana_cost := spell.calculate_mana_cost()
+		if not _spend_mana(mana_cost):
 			return
 		_cast_timer = CAST_COOLDOWN
-		_cast_self_effect_spell(spell)
+		_cast_self_effect_spell(spell, mana_cost)
 		return
 	if spell.shape == "Sphere" and spell.has_charging:
 		if not _spend_mana(spell.calculate_charged_mana_cost(spell.spell_size)):
@@ -681,6 +741,7 @@ func _start_beam(spell: SpellDefinition) -> void:
 	_beam_light.light_energy = 1.0 + spell.intensity * 0.4
 	_beam_light.omni_range = 3.0 + spell.spell_size * 0.4
 	_active_beam.add_child(_beam_light)
+	_broadcast_beam_start(spell)
 	_update_beam()
 
 
@@ -695,6 +756,7 @@ func _stop_beam() -> void:
 	_beam_core = null
 	_beam_tip = null
 	_beam_light = null
+	_broadcast_beam_stop()
 
 
 func _update_beam() -> void:
@@ -739,6 +801,7 @@ func _update_beam() -> void:
 	_beam_tip.global_position = visible_target
 	_beam_tip.scale = Vector3.ONE * (0.7 + thickness * 4.0 + pulse_strength * pulse)
 	_beam_light.global_position = visible_target
+	_broadcast_beam_update(origin, visible_target)
 
 	if has_hit and length >= target_length - 0.05 and _beam_impact_timer <= 0.0:
 		if _is_network_client():
@@ -766,6 +829,160 @@ func _get_beam_propagation_speed(spell_speed: int) -> float:
 	return 1.8 + pow(float(spell_speed), 1.55) * 2.1
 
 
+func _broadcast_beam_start(spell: SpellDefinition) -> void:
+	if multiplayer.multiplayer_peer == null:
+		return
+	var spell_data := SpellNetworkCodecScript.to_dict(spell)
+	if multiplayer.is_server():
+		_client_start_beam_visual.rpc(spell_data, _network_peer_id)
+	else:
+		_server_start_beam_visual.rpc_id(1, spell_data)
+
+
+func _broadcast_beam_update(origin: Vector3, target: Vector3) -> void:
+	if multiplayer.multiplayer_peer == null:
+		return
+	if multiplayer.is_server():
+		_client_update_beam_visual.rpc(origin, target, _network_peer_id)
+	else:
+		_server_update_beam_visual.rpc_id(1, origin, target)
+
+
+func _broadcast_beam_stop() -> void:
+	if multiplayer.multiplayer_peer == null:
+		return
+	if multiplayer.is_server():
+		_client_stop_beam_visual.rpc(_network_peer_id)
+	else:
+		_server_stop_beam_visual.rpc_id(1)
+
+
+@rpc("any_peer", "reliable")
+func _server_start_beam_visual(spell_data: Dictionary) -> void:
+	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
+		return
+	_client_start_beam_visual.rpc(spell_data, _network_peer_id)
+	_start_remote_beam_visual(SpellNetworkCodecScript.from_dict(spell_data))
+
+
+@rpc("any_peer", "unreliable")
+func _server_update_beam_visual(origin: Vector3, target: Vector3) -> void:
+	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
+		return
+	_client_update_beam_visual.rpc(origin, target, _network_peer_id)
+	_update_remote_beam_visual(origin, target)
+
+
+@rpc("any_peer", "reliable")
+func _server_stop_beam_visual() -> void:
+	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
+		return
+	_client_stop_beam_visual.rpc(_network_peer_id)
+	_stop_remote_beam_visual()
+
+
+@rpc("any_peer", "reliable")
+func _client_start_beam_visual(spell_data: Dictionary, source_peer_id: int) -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+		return
+	if source_peer_id == multiplayer.get_unique_id():
+		return
+	_start_remote_beam_visual(SpellNetworkCodecScript.from_dict(spell_data))
+
+
+@rpc("any_peer", "unreliable")
+func _client_update_beam_visual(origin: Vector3, target: Vector3, source_peer_id: int) -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+		return
+	if source_peer_id == multiplayer.get_unique_id():
+		return
+	_update_remote_beam_visual(origin, target)
+
+
+@rpc("any_peer", "reliable")
+func _client_stop_beam_visual(source_peer_id: int) -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+		return
+	if source_peer_id == multiplayer.get_unique_id():
+		return
+	_stop_remote_beam_visual()
+
+
+func _start_remote_beam_visual(spell: SpellDefinition) -> void:
+	_stop_remote_beam_visual()
+	_remote_beam_spell = spell
+	_remote_beam = Node3D.new()
+	get_tree().current_scene.add_child(_remote_beam)
+
+	var col: Color = _get_spell_color(spell)
+	var core_mat := StandardMaterial3D.new()
+	core_mat.albedo_color = col
+	core_mat.emission_enabled = true
+	core_mat.emission = col
+	core_mat.emission_energy_multiplier = 2.0 + spell.intensity * 0.25
+
+	_remote_beam_core = MeshInstance3D.new()
+	_remote_beam_core.mesh = CylinderMesh.new()
+	_remote_beam_core.material_override = core_mat
+	_remote_beam.add_child(_remote_beam_core)
+
+	var tip_mesh := SphereMesh.new()
+	tip_mesh.radius = 0.18
+	tip_mesh.height = 0.36
+	_remote_beam_tip = MeshInstance3D.new()
+	_remote_beam_tip.mesh = tip_mesh
+	_remote_beam_tip.material_override = core_mat
+	_remote_beam.add_child(_remote_beam_tip)
+
+	_remote_beam_light = OmniLight3D.new()
+	_remote_beam_light.light_color = col
+	_remote_beam_light.light_energy = 1.0 + spell.intensity * 0.4
+	_remote_beam_light.omni_range = 3.0 + spell.spell_size * 0.4
+	_remote_beam.add_child(_remote_beam_light)
+	_remote_beam_last_update_time = _network_time()
+
+
+func _update_remote_beam_visual(origin: Vector3, target: Vector3) -> void:
+	if _remote_beam == null or _remote_beam_spell == null:
+		return
+	_remote_beam_origin = origin
+	_remote_beam_target = target
+	_remote_beam_last_update_time = _network_time()
+	_apply_remote_beam_transform()
+
+
+func _apply_remote_beam_transform() -> void:
+	if _remote_beam_core == null or _remote_beam_tip == null or _remote_beam_light == null or _remote_beam_spell == null:
+		return
+	var length: float = maxf(0.1, _remote_beam_origin.distance_to(_remote_beam_target))
+	var midpoint: Vector3 = _remote_beam_origin.lerp(_remote_beam_target, 0.5)
+	var thickness: float = 0.08 + (_remote_beam_spell.spell_size - 1) * 0.025
+	var mesh := _remote_beam_core.mesh as CylinderMesh
+	mesh.top_radius = thickness
+	mesh.bottom_radius = thickness
+	mesh.height = length
+	_remote_beam_core.global_position = midpoint
+	_remote_beam_core.look_at(_remote_beam_target, Vector3.UP)
+	_remote_beam_core.rotate_object_local(Vector3.RIGHT, PI / 2.0)
+	var pulse_rate: float = 0.004 + _remote_beam_spell.spell_speed * 0.012
+	var pulse_strength: float = 0.12 + _remote_beam_spell.spell_speed * 0.018
+	var pulse := 1.0 + sin(Time.get_ticks_msec() * pulse_rate) * pulse_strength
+	_remote_beam_core.scale = Vector3(pulse, 1.0, pulse)
+	_remote_beam_tip.global_position = _remote_beam_target
+	_remote_beam_tip.scale = Vector3.ONE * (0.7 + thickness * 4.0 + pulse_strength * pulse)
+	_remote_beam_light.global_position = _remote_beam_target
+
+
+func _stop_remote_beam_visual() -> void:
+	if _remote_beam != null:
+		_remote_beam.queue_free()
+	_remote_beam = null
+	_remote_beam_spell = null
+	_remote_beam_core = null
+	_remote_beam_tip = null
+	_remote_beam_light = null
+
+
 func _get_spell_color(spell: SpellDefinition) -> Color:
 	var weights := spell.get_base_weights()
 	if weights.is_empty():
@@ -781,23 +998,30 @@ func _get_spell_color(spell: SpellDefinition) -> Color:
 	return color / total_weight
 
 
-func _spawn_spell_impact(spell: SpellDefinition, position: Vector3, normal: Vector3) -> void:
+func _spawn_spell_impact(spell: SpellDefinition, position: Vector3, normal: Vector3, broadcast_to_clients: bool = true) -> void:
 	var effect := SpellImpactEffectScript.new()
 	get_tree().current_scene.add_child(effect)
 	effect.initialize(spell, position, normal, self)
+	var world := get_tree().current_scene
+	if broadcast_to_clients and multiplayer.multiplayer_peer != null and multiplayer.is_server() and world != null and world.has_method("broadcast_spell_impact"):
+		world.broadcast_spell_impact(spell, position, normal)
 
 
 func _cast_projectile_spell(spell: SpellDefinition, from: Vector3, direction: Vector3) -> void:
 	if _is_network_client():
+		var world := get_tree().current_scene
+		if world != null and world.has_method("remember_predicted_projectile"):
+			world.remember_predicted_projectile(spell, from, direction)
 		_spawn_projectile_local(spell, from, direction, self)
 		_server_cast_projectile.rpc_id(1, SpellNetworkCodecScript.to_dict(spell), from, direction, _network_time())
 		return
 	_spawn_projectile_for_all(spell, from, direction)
 
 
-func _cast_self_effect_spell(spell: SpellDefinition) -> void:
+func _cast_self_effect_spell(spell: SpellDefinition, mana_cost_paid: float = -1.0) -> void:
+	var mana_cost := mana_cost_paid if mana_cost_paid >= 0.0 else float(spell.calculate_mana_cost())
 	if _is_network_client():
-		_server_cast_self_effect.rpc_id(1, SpellNetworkCodecScript.to_dict(spell))
+		_server_cast_self_effect.rpc_id(1, SpellNetworkCodecScript.to_dict(spell), mana_cost)
 		return
 	_apply_self_effect_for_all(spell)
 
@@ -810,10 +1034,16 @@ func _server_cast_projectile(spell_data: Dictionary, from: Vector3, direction: V
 
 
 @rpc("any_peer", "reliable")
-func _server_cast_self_effect(spell_data: Dictionary) -> void:
+func _server_cast_self_effect(spell_data: Dictionary, mana_cost_paid: float = -1.0) -> void:
 	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
 		return
-	_apply_self_effect_for_all(SpellNetworkCodecScript.from_dict(spell_data))
+	var spell := SpellNetworkCodecScript.from_dict(spell_data)
+	var mana_cost := mana_cost_paid if mana_cost_paid >= 0.0 else float(spell.calculate_mana_cost())
+	if not _spend_mana(mana_cost):
+		_broadcast_combat_state()
+		return
+	_apply_self_effect_for_all(spell)
+	_broadcast_combat_state()
 
 
 @rpc("any_peer", "reliable")
@@ -877,7 +1107,7 @@ func _client_apply_self_effect(spell_data: Dictionary, source_peer_id: int) -> v
 
 func _apply_self_effect_local(spell: SpellDefinition) -> void:
 	_heal(spell.calculate_healing(false))
-	_spawn_spell_impact(spell, global_position + Vector3.UP * 0.7, Vector3.UP)
+	_spawn_spell_impact(spell, global_position + Vector3.UP * 0.7, Vector3.UP, false)
 
 
 func _find_network_player(peer_id: int) -> Node:
@@ -940,10 +1170,11 @@ func _release_charged_sphere() -> void:
 		return
 
 	var charged_spell := _create_charged_sphere_spell()
+	var charged_mana_cost := _charging_sphere_spell.calculate_charged_mana_cost(_charging_sphere_paid_size)
 	_cancel_charged_sphere()
 	_cast_timer = CAST_COOLDOWN
 	if charged_spell.is_healing_spell():
-		_cast_self_effect_spell(charged_spell)
+		_cast_self_effect_spell(charged_spell, charged_mana_cost)
 		return
 
 	_cast_projectile_spell(charged_spell, _get_cast_origin(), _get_aim_direction())
@@ -1111,6 +1342,16 @@ func _heal(amount: int) -> void:
 	_update_health_hud()
 
 
+func _apply_fall_damage(fall_distance: float) -> bool:
+	if _is_dead or fall_distance <= FALL_DAMAGE_SAFE_HEIGHT:
+		return false
+	var damage := int(round((fall_distance - FALL_DAMAGE_SAFE_HEIGHT) * FALL_DAMAGE_PER_METER))
+	if damage <= 0:
+		return false
+	_take_damage(damage)
+	return true
+
+
 func _apply_pushback(spell: SpellDefinition, hit_position: Vector3, hit_normal: Vector3, is_beam_tick: bool) -> void:
 	if not spell.get_base_elements().has("Water"):
 		return
@@ -1189,6 +1430,14 @@ func _respawn() -> void:
 	global_position = _respawn_position
 	velocity = Vector3.ZERO
 	_external_velocity = Vector3.ZERO
+	_was_on_floor_last_frame = true
+	_fall_peak_y = global_position.y
+	_server_was_falling = false
+	_server_fall_peak_y = global_position.y
+	_server_previous_pos = global_position
+	_server_previous_velocity = Vector3.ZERO
+	_server_has_previous_motion = false
+	_jump_was_pressed_last_frame = false
 	_server_state_lock_timer = 0.35
 	_blind_timer = 0.0
 	_blind_duration = 0.0
@@ -1202,11 +1451,15 @@ func _respawn() -> void:
 
 
 func _physics_process(delta: float) -> void:
+	var was_on_floor_at_start := is_on_floor()
 	if _server_state_lock_timer > 0.0:
 		_server_state_lock_timer = maxf(0.0, _server_state_lock_timer - delta)
 	if not _is_local_player:
-		if multiplayer.multiplayer_peer != null and multiplayer.is_server() and _is_dead:
-			_tick_server_respawn(delta)
+		if multiplayer.multiplayer_peer != null and multiplayer.is_server():
+			if _is_dead:
+				_tick_server_respawn(delta)
+			else:
+				_restore_mana(MANA_REGEN_PER_SECOND * delta)
 		return
 	if _cast_timer > 0.0:
 		_cast_timer -= delta
@@ -1238,11 +1491,18 @@ func _physics_process(delta: float) -> void:
 	if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 		_cancel_charged_sphere()
 		_stop_beam()
+		_jump_was_pressed_last_frame = Input.is_key_pressed(KEY_SPACE)
 		velocity.x = move_toward(velocity.x, 0, SPEED)
 		velocity.z = move_toward(velocity.z, 0, SPEED)
 		if not is_on_floor():
 			velocity.y -= GRAVITY * delta
+		var pre_slide_vy := velocity.y
+		var pre_slide_y := global_position.y
 		move_and_slide()
+		if pre_slide_vy < 0.0:
+			if velocity.y > 0.0 or (pre_slide_y - global_position.y) < absf(pre_slide_vy * delta) * 0.5:
+				velocity.y = 0.0
+		_update_local_fall_damage_after_move(was_on_floor_at_start)
 		_sync_network_state(delta)
 		return
 
@@ -1258,8 +1518,10 @@ func _physics_process(delta: float) -> void:
 	if not is_on_floor():
 		velocity.y -= GRAVITY * delta
 
-	if Input.is_key_pressed(KEY_SPACE) and is_on_floor():
+	var jump_pressed := Input.is_key_pressed(KEY_SPACE)
+	if jump_pressed and not _jump_was_pressed_last_frame and is_on_floor():
 		velocity.y = JUMP_VELOCITY
+	_jump_was_pressed_last_frame = jump_pressed
 
 	var move_dir := Vector2.ZERO
 	if Input.is_key_pressed(KEY_W): move_dir.y -= 1
@@ -1277,9 +1539,49 @@ func _physics_process(delta: float) -> void:
 	if _external_velocity.y > 0.0:
 		velocity.y = maxf(velocity.y, _external_velocity.y)
 
+	var pre_slide_vy := velocity.y
+	var pre_slide_y := global_position.y
 	move_and_slide()
+	if pre_slide_vy < 0.0:
+		if velocity.y > 0.0 or (pre_slide_y - global_position.y) < absf(pre_slide_vy * delta) * 0.5:
+			velocity.y = 0.0
+	_update_local_fall_damage_after_move(was_on_floor_at_start)
 	_record_server_position()
 	_sync_network_state(delta)
+
+
+func _update_local_fall_damage_after_move(was_on_floor_at_start: bool) -> void:
+	var now_on_floor := is_on_floor()
+	if now_on_floor:
+		velocity.y = 0.0
+		if not was_on_floor_at_start:
+			_external_velocity.y = 0.0
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server():
+		if now_on_floor and not _was_on_floor_last_frame:
+			_absorb_landing_momentum(maxf(0.0, _fall_peak_y - global_position.y))
+		_was_on_floor_last_frame = now_on_floor
+		_fall_peak_y = global_position.y if now_on_floor else maxf(_fall_peak_y, global_position.y)
+		return
+	if was_on_floor_at_start and not now_on_floor:
+		_fall_peak_y = global_position.y
+	elif not now_on_floor:
+		_fall_peak_y = maxf(_fall_peak_y, global_position.y)
+	elif not _was_on_floor_last_frame:
+		var fall_distance := maxf(0.0, _fall_peak_y - global_position.y)
+		_absorb_landing_momentum(fall_distance)
+		if _apply_fall_damage(fall_distance) and multiplayer.multiplayer_peer != null and multiplayer.is_server():
+			_broadcast_combat_state()
+		_fall_peak_y = global_position.y
+	elif now_on_floor:
+		_fall_peak_y = global_position.y
+	_was_on_floor_last_frame = now_on_floor
+
+
+func _absorb_landing_momentum(fall_distance: float) -> void:
+	if fall_distance < HARD_LANDING_MOMENTUM_CANCEL_HEIGHT:
+		return
+	velocity = Vector3.ZERO
+	_external_velocity = Vector3.ZERO
 
 
 func _tick_server_respawn(delta: float) -> void:
@@ -1418,10 +1720,12 @@ func _apply_combat_state(
 	_kill_zone_respawn_timer = -1.0
 	_blind_timer = blind_timer
 	_blind_duration = blind_duration
-	global_position = pos
-	_remote_snapshots.clear()
+	var should_snap_position := not _is_local_player or _is_dead or global_position.distance_to(pos) > 1.5
+	if should_snap_position:
+		global_position = pos
+		_remote_snapshots.clear()
 	_external_velocity = external_velocity
-	if not _is_dead and health == MAX_HEALTH:
+	if should_snap_position and not _is_dead and health == MAX_HEALTH:
 		velocity = Vector3.ZERO
 		if external_velocity.length_squared() <= 0.001:
 			_external_velocity = Vector3.ZERO
@@ -1455,9 +1759,46 @@ func _server_receive_player_state(pos: Vector3, net_velocity: Vector3, yaw: floa
 	if _server_state_lock_timer > 0.0:
 		_client_receive_player_state.rpc(_network_peer_id, global_position, velocity, rotation.y, _head.rotation.x if _head != null else 0.0, _network_time())
 		return
+	_update_server_fall_damage_from_motion(pos, net_velocity)
 	velocity = net_velocity
 	add_remote_snapshot(pos, net_velocity, yaw, head_pitch, _network_time())
 	_client_receive_player_state.rpc(_network_peer_id, pos, net_velocity, yaw, head_pitch, _network_time())
+
+
+func _update_server_fall_damage_from_motion(pos: Vector3, net_velocity: Vector3) -> void:
+	if _is_dead:
+		_server_has_previous_motion = true
+		_server_previous_pos = pos
+		_server_previous_velocity = net_velocity
+		return
+	if not _server_has_previous_motion:
+		_server_has_previous_motion = true
+		_server_previous_pos = pos
+		_server_previous_velocity = net_velocity
+		_server_fall_peak_y = pos.y
+		return
+
+	var previous_velocity := _server_previous_velocity
+	if net_velocity.y > FALL_LANDING_VELOCITY_EPSILON:
+		_server_fall_peak_y = maxf(_server_fall_peak_y, pos.y)
+		_server_was_falling = false
+	elif net_velocity.y < -FALL_LANDING_VELOCITY_EPSILON:
+		if not _server_was_falling:
+			_server_fall_peak_y = maxf(_server_previous_pos.y, pos.y)
+		else:
+			_server_fall_peak_y = maxf(_server_fall_peak_y, pos.y)
+		_server_was_falling = true
+	elif _server_was_falling and previous_velocity.y < -FALL_LANDING_VELOCITY_EPSILON:
+		var fall_distance := maxf(0.0, _server_fall_peak_y - pos.y)
+		if _apply_fall_damage(fall_distance):
+			_broadcast_combat_state()
+		_server_was_falling = false
+		_server_fall_peak_y = pos.y
+	else:
+		_server_fall_peak_y = maxf(_server_fall_peak_y, pos.y)
+
+	_server_previous_pos = pos
+	_server_previous_velocity = net_velocity
 
 
 @rpc("any_peer", "unreliable")

@@ -1,6 +1,7 @@
 extends Node
 
 signal bot_settings_changed
+signal fullscreen_changed(enabled: bool)
 
 const MIN_BOT_COUNT := 0
 const MAX_BOT_COUNT := 12
@@ -9,6 +10,30 @@ const DIFFICULTIES := ["Easy", "Medium", "Hard"]
 var bots_enabled: bool = true
 var bot_count: int = 1
 var bot_difficulty: String = "Medium"
+
+
+func has_window_display() -> bool:
+	return DisplayServer.get_name().to_lower() != "headless"
+
+
+func is_fullscreen() -> bool:
+	if not has_window_display():
+		return false
+	return DisplayServer.window_get_mode() == DisplayServer.WINDOW_MODE_FULLSCREEN
+
+
+func set_fullscreen(enabled: bool) -> void:
+	if not has_window_display():
+		return
+	var target_mode := DisplayServer.WINDOW_MODE_FULLSCREEN if enabled else DisplayServer.WINDOW_MODE_WINDOWED
+	if DisplayServer.window_get_mode() == target_mode:
+		return
+	DisplayServer.window_set_mode(target_mode)
+	fullscreen_changed.emit(enabled)
+
+
+func toggle_fullscreen() -> void:
+	set_fullscreen(not is_fullscreen())
 
 
 func set_bot_settings(enabled: bool, count: int = bot_count, difficulty: String = bot_difficulty) -> bool:

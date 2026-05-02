@@ -13,6 +13,7 @@ var _port_input: SpinBox
 var _bots_check: CheckBox
 var _bot_count_spin: SpinBox
 var _difficulty_options: OptionButton
+var _fullscreen_btn: Button
 
 
 func _ready() -> void:
@@ -20,6 +21,13 @@ func _ready() -> void:
 		return
 	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 	_build_ui()
+	if not GameSettings.fullscreen_changed.is_connected(_on_fullscreen_changed):
+		GameSettings.fullscreen_changed.connect(_on_fullscreen_changed)
+
+
+func _unhandled_input(event: InputEvent) -> void:
+	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_F11:
+		GameSettings.toggle_fullscreen()
 
 
 func _build_ui() -> void:
@@ -86,6 +94,11 @@ func _show_main_options() -> void:
 	var play_btn := _make_menu_button("Play")
 	play_btn.pressed.connect(_show_play_options)
 	_add_menu_item(play_btn)
+
+	_fullscreen_btn = _make_menu_button("")
+	_update_fullscreen_button()
+	_fullscreen_btn.pressed.connect(GameSettings.toggle_fullscreen)
+	_add_menu_item(_fullscreen_btn)
 
 	var exit_btn := _make_menu_button("Exit")
 	exit_btn.pressed.connect(_exit_app)
@@ -187,6 +200,16 @@ func _make_menu_button(text: String) -> Button:
 	btn.custom_minimum_size.y = 42
 	btn.size_flags_horizontal = SIZE_EXPAND_FILL
 	return btn
+
+
+func _on_fullscreen_changed(_enabled: bool) -> void:
+	_update_fullscreen_button()
+
+
+func _update_fullscreen_button() -> void:
+	if _fullscreen_btn == null:
+		return
+	_fullscreen_btn.text = "Windowed" if GameSettings.is_fullscreen() else "Fullscreen"
 
 
 func _go_to_spell_creator() -> void:

@@ -16,6 +16,9 @@ var _basic_caster: Node3D
 var _basic_casters: Dictionary = {}
 var _creator_layer: CanvasLayer
 var _peers_in_creator: Dictionary = {}
+var _active_spell_impacts: Array[Dictionary] = []
+var _next_spell_impact_id: int = 1
+var _predicted_projectile_echoes: Array[Dictionary] = []
 
 
 func _ready() -> void:
@@ -32,6 +35,13 @@ func _ready() -> void:
 		_spawn_single_player()
 		_spawn_configured_bots()
 	_spawn_push_test_target()
+
+
+func _process(_delta: float) -> void:
+	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
+		_prune_expired_spell_impacts()
+	else:
+		_prune_predicted_projectile_echoes()
 
 
 func _setup_multiplayer_world() -> void:
@@ -142,6 +152,7 @@ func _request_world_state() -> void:
 				caster.get_spell_loadout_data() if caster.has_method("get_spell_loadout_data") else [],
 				caster.get_difficulty_data() if caster.has_method("get_difficulty_data") else _get_bot_difficulty_data()
 			)
+	_send_active_spell_impacts(peer_id)
 	if not _players.has(peer_id):
 		var spawn_position := _get_spawn_position(_players.size())
 		_spawn_player_for_peer.rpc(peer_id, spawn_position)
@@ -535,16 +546,29 @@ func spawn_network_projectile(spell: SpellDefinition, from: Vector3, direction: 
 	_client_spawn_network_projectile.rpc(SpellNetworkCodecScript.to_dict(spell), from, direction, source_peer_id)
 
 
+func remember_predicted_projectile(spell: SpellDefinition, from: Vector3, direction: Vector3) -> void:
+	if multiplayer.multiplayer_peer == null or multiplayer.is_server():
+		return
+	_predicted_projectile_echoes.append({
+		"spell_key": _get_projectile_prediction_spell_key(spell),
+		"from": from,
+		"direction": direction.normalized(),
+		"created_at": Time.get_ticks_msec() / 1000.0,
+	})
+	_prune_predicted_projectile_echoes()
+
+
 @rpc("any_peer", "reliable")
 func _client_spawn_network_projectile(spell_data: Dictionary, from: Vector3, direction: Vector3, source_peer_id: int) -> void:
 	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
 		return
 	if multiplayer.is_server():
 		return
-	if source_peer_id == multiplayer.get_unique_id():
+	var spell := SpellNetworkCodecScript.from_dict(spell_data)
+	if source_peer_id == multiplayer.get_unique_id() or _consume_predicted_projectile_echo(spell, from, direction):
 		return
 	var source := _players.get(source_peer_id) as Node
-	_spawn_projectile_local(SpellNetworkCodecScript.from_dict(spell_data), from, direction, source)
+	_spawn_projectile_local(spell, from, direction, source)
 
 
 func _spawn_projectile_local(spell: SpellDefinition, from: Vector3, direction: Vector3, source: Node, cast_server_time: float = -1.0) -> void:
@@ -553,22 +577,106 @@ func _spawn_projectile_local(spell: SpellDefinition, from: Vector3, direction: V
 	projectile.initialize(spell, from, direction, source, cast_server_time)
 
 
+func _consume_predicted_projectile_echo(spell: SpellDefinition, from: Vector3, direction: Vector3) -> bool:
+	_prune_predicted_projectile_echoes()
+	var spell_key := _get_projectile_prediction_spell_key(spell)
+	var normalized_direction := direction.normalized()
+	for i in range(_predicted_projectile_echoes.size() - 1, -1, -1):
+		var prediction := _predicted_projectile_echoes[i]
+		var predicted_direction := prediction["direction"] as Vector3
+		if str(prediction["spell_key"]) != spell_key:
+			continue
+		if (prediction["from"] as Vector3).distance_to(from) > 1.2:
+			continue
+		if predicted_direction.dot(normalized_direction) < 0.985:
+			continue
+		_predicted_projectile_echoes.remove_at(i)
+		return true
+	return false
+
+
+func _prune_predicted_projectile_echoes() -> void:
+	var now := Time.get_ticks_msec() / 1000.0
+	for i in range(_predicted_projectile_echoes.size() - 1, -1, -1):
+		if now - float(_predicted_projectile_echoes[i]["created_at"]) > 1.5:
+			_predicted_projectile_echoes.remove_at(i)
+
+
+func _get_projectile_prediction_spell_key(spell: SpellDefinition) -> String:
+	if spell == null:
+		return ""
+	return "%s|%s|%s|%d|%d|%d|%d" % [
+		spell.spell_name,
+		spell.get_blend_key(),
+		spell.shape,
+		spell.intensity,
+		spell.spell_size,
+		spell.spell_range,
+		spell.spell_speed,
+	]
+
+
 func broadcast_spell_impact(spell: SpellDefinition, position: Vector3, normal: Vector3) -> void:
 	if multiplayer.multiplayer_peer == null or not multiplayer.is_server():
 		return
-	_client_spawn_spell_impact.rpc(SpellNetworkCodecScript.to_dict(spell), position, normal)
+	var spell_data := SpellNetworkCodecScript.to_dict(spell)
+	var impact_id := _remember_spell_impact(spell_data, position, normal)
+	_client_spawn_spell_impact.rpc(impact_id, spell_data, position, normal, 0.0)
 
 
 @rpc("any_peer", "reliable")
-func _client_spawn_spell_impact(spell_data: Dictionary, position: Vector3, normal: Vector3) -> void:
+func _client_spawn_spell_impact(impact_id: int, spell_data: Dictionary, position: Vector3, normal: Vector3, age: float = 0.0) -> void:
 	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
 		return
 	if multiplayer.is_server():
 		return
 	var effect := SpellImpactEffectScript.new()
+	effect.name = "SpellImpact_%d" % impact_id
 	get_tree().current_scene.add_child(effect)
-	effect.initialize(SpellNetworkCodecScript.from_dict(spell_data), position, normal, null)
+	effect.initialize(SpellNetworkCodecScript.from_dict(spell_data), position, normal, null, age)
 	effect.set_visual_only(true)
+
+
+func _remember_spell_impact(spell_data: Dictionary, position: Vector3, normal: Vector3) -> int:
+	_prune_expired_spell_impacts()
+	var spell := SpellNetworkCodecScript.from_dict(spell_data)
+	var lifetime: float = SpellImpactEffectScript.estimate_lifetime(spell)
+	var impact_id := _next_spell_impact_id
+	_next_spell_impact_id += 1
+	_active_spell_impacts.append({
+		"id": impact_id,
+		"spell_data": spell_data,
+		"position": position,
+		"normal": normal,
+		"created_at": Time.get_ticks_msec() / 1000.0,
+		"lifetime": lifetime,
+	})
+	return impact_id
+
+
+func _send_active_spell_impacts(peer_id: int) -> void:
+	if multiplayer.multiplayer_peer == null or not multiplayer.is_server():
+		return
+	_prune_expired_spell_impacts()
+	var now := Time.get_ticks_msec() / 1000.0
+	for impact in _active_spell_impacts:
+		var age := now - float(impact["created_at"])
+		_client_spawn_spell_impact.rpc_id(
+			peer_id,
+			int(impact["id"]),
+			impact["spell_data"] as Dictionary,
+			impact["position"] as Vector3,
+			impact["normal"] as Vector3,
+			age
+		)
+
+
+func _prune_expired_spell_impacts() -> void:
+	var now := Time.get_ticks_msec() / 1000.0
+	for i in range(_active_spell_impacts.size() - 1, -1, -1):
+		var impact := _active_spell_impacts[i]
+		if now - float(impact["created_at"]) >= float(impact["lifetime"]):
+			_active_spell_impacts.remove_at(i)
 
 
 
