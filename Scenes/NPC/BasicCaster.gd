@@ -20,6 +20,9 @@ const KILL_ZONE_Y := -12.0
 const REMOTE_INTERPOLATION_DELAY := 0.14
 const REMOTE_SNAPSHOT_LIMIT := 12
 const REMOTE_EXTRAPOLATION_LIMIT := 0.2
+const NPC_BODY_COLOR := Color(0.18, 0.07, 0.22)
+const NPC_EMISSION_COLOR := Color(1.0, 0.18, 0.82)
+const NPC_LABEL_COLOR := Color(1.0, 0.48, 0.92)
 
 var target: Node3D
 var _cooldown: float = 1.6
@@ -73,9 +76,9 @@ func _build_body() -> void:
 	mesh_inst.mesh = mesh
 	mesh_inst.position.y = 0.75
 	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.35, 0.08, 0.04)
+	mat.albedo_color = NPC_BODY_COLOR
 	mat.emission_enabled = true
-	mat.emission = Color(0.65, 0.12, 0.04)
+	mat.emission = NPC_EMISSION_COLOR
 	mat.emission_energy_multiplier = 0.25
 	mesh_inst.material_override = mat
 	_body.add_child(mesh_inst)
@@ -84,7 +87,7 @@ func _build_body() -> void:
 	_health_label.position = Vector3(0.0, 1.9, 0.0)
 	_health_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 	_health_label.font_size = 36
-	_health_label.modulate = Color(1.0, 0.55, 0.45)
+	_health_label.modulate = NPC_LABEL_COLOR
 	add_child(_health_label)
 	_update_health_label()
 
