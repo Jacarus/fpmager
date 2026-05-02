@@ -26,9 +26,23 @@ var _light: OmniLight3D
 var _label: Label3D
 
 
-func initialize(spell: SpellDefinition, impact_position: Vector3, normal: Vector3 = Vector3.UP, source: Node = null) -> void:
+static func estimate_lifetime(spell: SpellDefinition) -> float:
+	if spell == null:
+		return 1.2
+	var effect := spell.get_complex_effect()
+	if effect.is_empty():
+		return 1.2
+	var stats: Dictionary = effect["stats"]
+	var lifetime := 1.1 + float(stats.get("Area", 3)) * 0.12 + float(stats.get("Control", 0)) * 0.04
+	if spell.is_blind_spell():
+		lifetime = maxf(lifetime, 0.9)
+	return lifetime
+
+
+func initialize(spell: SpellDefinition, impact_position: Vector3, normal: Vector3 = Vector3.UP, source: Node = null, initial_age: float = 0.0) -> void:
 	_spell = spell
 	_source = source
+	_age = maxf(0.0, initial_age)
 	global_position = impact_position + normal.normalized() * 0.04
 
 	var effect := spell.get_complex_effect()
@@ -115,13 +129,7 @@ func _calculate_radius(spell: SpellDefinition, effect: Dictionary) -> float:
 
 
 func _calculate_lifetime(effect: Dictionary) -> float:
-	if effect.is_empty():
-		return 1.2
-	var stats: Dictionary = effect["stats"]
-	var lifetime := 1.1 + float(stats.get("Area", 3)) * 0.12 + float(stats.get("Control", 0)) * 0.04
-	if _spell != null and _spell.is_blind_spell():
-		lifetime = maxf(lifetime, 0.9)
-	return lifetime
+	return estimate_lifetime(_spell)
 
 
 func _apply_blind_flash() -> void:

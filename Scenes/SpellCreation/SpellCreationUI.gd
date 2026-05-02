@@ -1338,10 +1338,11 @@ func _on_save_pressed() -> void:
 		var remove_err := DirAccess.remove_absolute(old_path)
 		if remove_err != OK:
 			push_error("Failed to remove renamed spell file: %s" % error_string(remove_err))
-	for i in range(_loadout_paths.size()):
-		if _loadout_paths[i] == old_path:
-			_loadout_paths[i] = path
-	_save_loadout()
+	if not old_path.is_empty():
+		for i in range(_loadout_paths.size()):
+			if _loadout_paths[i] == old_path:
+				_loadout_paths[i] = path
+		_save_loadout()
 	print("Spell saved: ", path)
 	_selected_saved_spell_path = path
 	_selected_saved_spell = spell

@@ -17,6 +17,9 @@ const DIRECT_GRAVITY_RADIUS := 3.0
 const MAX_MANA := 100.0
 const MANA_REGEN_PER_SECOND := 14.0
 const KILL_ZONE_Y := -12.0
+const REMOTE_INTERPOLATION_DELAY := 0.14
+const REMOTE_SNAPSHOT_LIMIT := 12
+const REMOTE_EXTRAPOLATION_LIMIT := 0.2
 
 var target: Node3D
 var _cooldown: float = 1.6
@@ -38,6 +41,10 @@ var _net_sync_timer: float = 0.0
 var _spell_loadout_data: Array = []
 var _difficulty_data: Dictionary = {"difficulty": "Medium", "cast_cooldown": 3.0, "spell_budget": 120, "cast_when_ready": false}
 var _mana: float = MAX_MANA
+var _remote_snapshots: Array[Dictionary] = []
+var _remote_clock_offset: float = 0.0
+var _has_remote_clock_offset: bool = false
+var _remote_clock_samples: int = 0
 
 
 func _ready() -> void:
@@ -96,6 +103,7 @@ func _build_body() -> void:
 
 func _process(delta: float) -> void:
 	if _is_network_client():
+		_update_remote_visual_transform(delta)
 		return
 	if _blind_timer > 0.0:
 		_blind_timer = maxf(0.0, _blind_timer - delta)
@@ -415,20 +423,75 @@ func _sync_network_state(delta: float) -> void:
 	if _net_sync_timer > 0.0:
 		return
 	_net_sync_timer = 0.1
-	_client_receive_state.rpc(global_position, rotation.y, _health, _is_dead, _blind_timer)
+	_client_receive_state.rpc(global_position, rotation.y, _health, _is_dead, _blind_timer, _network_time())
 
 
 @rpc("authority", "unreliable")
-func _client_receive_state(pos: Vector3, yaw: float, health: int, is_dead: bool, blind_timer: float) -> void:
+func _client_receive_state(pos: Vector3, yaw: float, health: int, is_dead: bool, blind_timer: float, timestamp: float = -1.0) -> void:
 	if multiplayer.is_server():
 		return
-	global_position = pos
-	rotation.y = yaw
 	_health = health
 	_is_dead = is_dead
 	_blind_timer = blind_timer
+	_add_remote_snapshot(pos, yaw, timestamp if timestamp >= 0.0 else _network_time())
 	if _body != null:
 		_body.visible = not _is_dead
 	if _collision_shape != null:
 		_collision_shape.disabled = _is_dead
 	_update_health_label()
+
+
+func _add_remote_snapshot(pos: Vector3, yaw: float, timestamp: float) -> void:
+	var local_time := _network_time()
+	var measured_offset := local_time - timestamp
+	if not _has_remote_clock_offset:
+		_remote_clock_offset = measured_offset
+		_has_remote_clock_offset = true
+	else:
+		_remote_clock_samples += 1
+		var alpha := 0.15 if _remote_clock_samples < 30 else 0.03
+		_remote_clock_offset = lerpf(_remote_clock_offset, measured_offset, alpha)
+	_remote_snapshots.append({
+		"t": timestamp + _remote_clock_offset,
+		"pos": pos,
+		"yaw": yaw,
+	})
+	while _remote_snapshots.size() > REMOTE_SNAPSHOT_LIMIT:
+		_remote_snapshots.pop_front()
+	if _remote_snapshots.size() == 1:
+		global_position = pos
+		rotation.y = yaw
+
+
+func _update_remote_visual_transform(_delta: float) -> void:
+	if _remote_snapshots.is_empty():
+		return
+	var render_time := _network_time() - REMOTE_INTERPOLATION_DELAY
+	if _remote_snapshots.size() == 1:
+		_apply_remote_snapshot(_remote_snapshots[0])
+		return
+	for i in range(1, _remote_snapshots.size()):
+		var older: Dictionary = _remote_snapshots[i - 1]
+		var newer: Dictionary = _remote_snapshots[i]
+		if float(older["t"]) <= render_time and float(newer["t"]) >= render_time:
+			var span := maxf(float(newer["t"]) - float(older["t"]), 0.001)
+			var t := clampf((render_time - float(older["t"])) / span, 0.0, 1.0)
+			global_position = (older["pos"] as Vector3).lerp(newer["pos"] as Vector3, t)
+			rotation.y = lerp_angle(float(older["yaw"]), float(newer["yaw"]), t)
+			return
+	var latest: Dictionary = _remote_snapshots[_remote_snapshots.size() - 1]
+	var previous: Dictionary = _remote_snapshots[_remote_snapshots.size() - 2]
+	var elapsed := clampf(render_time - float(latest["t"]), 0.0, REMOTE_EXTRAPOLATION_LIMIT)
+	var span := maxf(float(latest["t"]) - float(previous["t"]), 0.001)
+	var estimated_velocity := ((latest["pos"] as Vector3) - (previous["pos"] as Vector3)) / span
+	global_position = latest["pos"] as Vector3 + estimated_velocity * elapsed
+	rotation.y = float(latest["yaw"])
+
+
+func _apply_remote_snapshot(snapshot: Dictionary) -> void:
+	global_position = snapshot["pos"] as Vector3
+	rotation.y = float(snapshot["yaw"])
+
+
+func _network_time() -> float:
+	return Time.get_ticks_msec() / 1000.0

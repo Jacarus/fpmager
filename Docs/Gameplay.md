@@ -8,7 +8,12 @@ Divided into 2 sections:
 On load, the app opens a main menu with:
     -Spell Creator: opens the spell creation UI
     -Play: opens Create / Join options
+    -Fullscreen / Windowed: toggles fullscreen display
     -Exit: closes the app
+
+The game targets a 1920x1080 viewport. The window is resizable and the UI scales
+with the window while the playable view expands to fit larger or fullscreen
+resolutions. F11 toggles fullscreen from the main menu or while playing.
 
 Create hosts an ENet server on port 24567 and joins it as the host player.
 Before hosting, Create opens host settings:
@@ -59,6 +64,12 @@ Online multiplayer uses Godot ENet networking.
     -Movement is sent from clients to the server and replicated to other clients.
     -Player combat state such as health, mana, death, respawn, and blind timers is
      replicated from the server through the world scene after authoritative hits.
+    -Client self-cast spells spend mana immediately for responsiveness, then the
+     server spends the same self-cast mana and sends back authoritative combat state
+     so the HUD does not snap back to stale mana.
+    -Local clients ignore small alive-position corrections from combat state, so
+     self-heal mana/health updates do not briefly freeze movement. Large corrections
+     such as death/respawn still snap to the server position.
     -Server combat state also includes external movement velocity, so authoritative
      Water push, caster recoil, and Void/Earth gravity impulses are applied on the
      owning client instead of only on the server copy.
@@ -67,17 +78,27 @@ Online multiplayer uses Godot ENet networking.
     -Projectile casts are requested by clients, spawned by the server through the
      world scene, and replicated to clients for predicted visuals.
     -The casting client spawns a local predicted projectile immediately, then skips
-     the matching server visual when it is echoed back.
+     the matching server visual when it is echoed back. Echo suppression uses both
+     the source peer id and a short-lived cast fingerprint so the client does not
+     see its own projectile twice if peer-id matching is late or inconsistent.
     -Client projectile prediction performs visual-only collision/impact feedback.
      Damage and lingering area effects are only applied from server-authoritative
      projectile/effect logic.
     -Server projectile impacts are broadcast back to clients as visual-only impact
      effects so clients see verified collisions.
+    -Server beam, projectile, and spell-collision impacts are broadcast as
+     visual-only effects to clients, including their 3D effect labels. Self-cast
+     healing effects use their own self-effect RPC path to avoid duplicate visuals.
+    -Clients that join while an impact/reaction effect is still active receive that
+     effect with its elapsed age so lingering fields such as Singularity remain visible.
     -NPC projectile attacks use the same server-spawned projectile replication path.
     -Projectile collision, projectile damage, and beam tick damage are authoritative
      on the server.
     -Death and respawn timers are server-authoritative. Clients can display the timer,
      but the server sends the final respawn state.
+    -Fall damage is applied when a player lands after falling more than 5 meters.
+     Damage scales by roughly 18 health per meter beyond the safe height, so a
+     sufficiently high fall can instantly kill a full-health player.
     -When a player opens the spell creator from the in-game menu, the server despawns
      their player body for all peers. Closing the creator requests a fresh spawn so
      loadout changes are picked up by the new player instance.
@@ -93,12 +114,15 @@ Online multiplayer uses Godot ENet networking.
     -Remote players keep a small snapshot ring buffer and render about 100ms behind
      the newest state, interpolating between snapshots instead of snapping to every
      packet.
+    -NPC casters use the same style of client-side snapshot interpolation, with a
+     slightly larger buffer because their server sync rate is lower than players.
     -If the buffer runs dry, remote players use capped dead reckoning from the latest
      position and velocity for up to 200ms.
     -Each remote stream estimates a small clock offset from packet timestamps so the
      interpolation buffer can line up peer times without a full clock-sync service yet.
-    -Beam visuals are currently drawn locally by the casting player; richer replicated
-     beam visuals are a follow-up.
+    -Beam visuals are replicated separately from beam damage. The casting player draws
+     their beam immediately, while the server relays visual-only beam start/update/stop
+     messages to the other peers.
 
 ##Spell creation##
 UI should dynamically update to show what the spell will look like in the characters hands / body (i.e. growing larger as its size is increased)

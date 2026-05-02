@@ -549,6 +549,8 @@ The base cost formula with multi-base support:
         -Selecting a saved spell loads it into the editor for viewing or editing.
         -Saving while a saved spell is selected updates/overwrites that spell.
         -Changing the selected spell's name updates its saved file path and loadout references.
+        -Saving a brand-new spell does not assign it to any loadout slot automatically.
+         Players manually assign saved spells to LMB, RMB, and Shift.
         -New Spell clears the current selection and starts a fresh spell.
         -Deleting a saved spell removes its resource and clears it from any loadout slot.
         -The creator has loadout controls for assigning saved spells to LMB, RMB, and Shift.
