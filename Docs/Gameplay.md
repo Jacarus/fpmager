@@ -138,8 +138,6 @@ Online multiplayer uses Godot ENet networking.
      instead of instantly passing through.
     -Fire/Water beam clashes stop both beams and create a larger Steam Clash cloud at
      the collision point.
-    -The arena includes a stationary BEAM TEST caster that continuously fires a Fire
-     beam across the arena for beam-collision testing.
 
 ##Spell creation##
 UI should dynamically update to show what the spell will look like in the characters hands / body (i.e. growing larger as its size is increased)

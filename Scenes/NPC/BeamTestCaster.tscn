@@ -1,6 +1,0 @@
-[gd_scene load_steps=2 format=3 uid="uid://beam_test_caster"]
-
-[ext_resource type="Script" path="res://Scenes/NPC/BeamTestCaster.gd" id="1_beam_test_caster"]
-
-[node name="BeamTestCaster" type="Node3D"]
-script = ExtResource("1_beam_test_caster")

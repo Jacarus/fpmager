@@ -2,7 +2,6 @@ extends Node3D
 
 const PlayerScene = preload("res://Scenes/Player/Player.tscn")
 const BasicCasterScene = preload("res://Scenes/NPC/BasicCaster.tscn")
-const BeamTestCasterScene = preload("res://Scenes/NPC/BeamTestCaster.tscn")
 const SpellProjectileScene = preload("res://Scenes/SpellProjectile/SpellProjectile.tscn")
 const SpellImpactEffectScript = preload("res://Scripts/SpellImpactEffect.gd")
 const SpellCreationScene = preload("res://Scenes/SpellCreation/SpellCreationUI.tscn")
@@ -44,7 +43,6 @@ var _predicted_projectile_echoes: Array[Dictionary] = []
 var _active_beam_segments: Dictionary = {}
 var _beam_collision_impacts: Dictionary = {}
 var _beam_clash_points: Dictionary = {}
-var _beam_test_caster: Node3D
 
 
 func _ready() -> void:
@@ -61,7 +59,6 @@ func _ready() -> void:
 		_spawn_single_player()
 		_spawn_configured_bots()
 	_spawn_push_test_target()
-	_spawn_beam_test_caster()
 
 
 func _process(_delta: float) -> void:
@@ -182,8 +179,6 @@ func _request_world_state() -> void:
 				caster.get_spell_loadout_data() if caster.has_method("get_spell_loadout_data") else [],
 				caster.get_difficulty_data() if caster.has_method("get_difficulty_data") else _get_bot_difficulty_data()
 			)
-	if _beam_test_caster != null:
-		_spawn_beam_test_caster_for_all.rpc_id(peer_id, _beam_test_caster.global_position)
 	_send_active_spell_impacts(peer_id)
 	if not _players.has(peer_id):
 		var spawn_position := _get_spawn_position(_players.size())
@@ -350,32 +345,6 @@ func _despawn_basic_caster_local(bot_id: int) -> void:
 				_basic_caster = existing
 				break
 	_refresh_basic_caster_target()
-
-
-func _spawn_beam_test_caster() -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server():
-		return
-	var pos := Vector3(-11.0, 0.0, -2.0)
-	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
-		_spawn_beam_test_caster_for_all.rpc(pos)
-	else:
-		_spawn_beam_test_caster_local(pos)
-
-
-@rpc("any_peer", "call_local", "reliable")
-func _spawn_beam_test_caster_for_all(spawn_position: Vector3) -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
-		return
-	_spawn_beam_test_caster_local(spawn_position)
-
-
-func _spawn_beam_test_caster_local(spawn_position: Vector3) -> void:
-	if _beam_test_caster != null:
-		return
-	_beam_test_caster = BeamTestCasterScene.instantiate()
-	_beam_test_caster.name = "BeamTestCaster"
-	_beam_test_caster.position = spawn_position
-	add_child(_beam_test_caster)
 
 
 func _update_existing_bot_difficulty() -> void:
@@ -778,6 +747,8 @@ func resolve_beam_segment(source_key: String, spell: SpellDefinition, origin: Ve
 func get_registered_beam_target(source_key: String, fallback: Vector3) -> Vector3:
 	var segment := _active_beam_segments.get(source_key, {}) as Dictionary
 	if segment.is_empty():
+		return fallback
+	if not bool(segment.get("blocked", false)):
 		return fallback
 	return segment.get("target", fallback) as Vector3
 
