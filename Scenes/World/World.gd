@@ -8,10 +8,17 @@ const SpellCreationScene = preload("res://Scenes/SpellCreation/SpellCreationUI.t
 const PushTestTargetScript = preload("res://Scenes/World/PushTestTarget.gd")
 const SpellNetworkCodecScript = preload("res://Scripts/SpellNetworkCodec.gd")
 const PLAYER_LOADOUT_CREDIT_LIMIT := 120
+const PLAYER_COLORS: Array[Color] = [
+	Color(0.2, 0.48, 1.0),
+	Color(1.0, 0.28, 0.22),
+	Color(0.18, 0.85, 0.42),
+	Color(1.0, 0.78, 0.18),
+]
 
 var _player: Node3D
 var _players_root: Node3D
 var _players: Dictionary = {}
+var _player_color_indices: Dictionary = {}
 var _basic_caster: Node3D
 var _basic_casters: Dictionary = {}
 var _creator_layer: CanvasLayer
@@ -49,7 +56,7 @@ func _setup_multiplayer_world() -> void:
 		if not multiplayer.peer_disconnected.is_connected(_on_peer_disconnected):
 			multiplayer.peer_disconnected.connect(_on_peer_disconnected)
 		if not _is_dedicated_server():
-			_spawn_player_for_peer(1, Vector3(0, 1.0, 8))
+			_spawn_player_for_peer(1, Vector3(0, 1.0, 8), _assign_player_color(1))
 		_spawn_configured_bots()
 	else:
 		_request_world_state.rpc_id(1)
@@ -129,6 +136,8 @@ func _add_box(pos: Vector3, size: Vector3, color: Color) -> void:
 func _spawn_single_player() -> void:
 	var player := PlayerScene.instantiate()
 	player.position = Vector3(0, 1.0, 8)
+	if player.has_method("set_player_color"):
+		player.set_player_color(PLAYER_COLORS[0])
 	_players_root.add_child(player)
 	_player = player
 
@@ -141,7 +150,7 @@ func _request_world_state() -> void:
 	for existing_peer_id in _players.keys():
 		var player := _players[existing_peer_id] as Node3D
 		if player != null:
-			_spawn_player_for_peer.rpc_id(peer_id, int(existing_peer_id), player.global_position)
+			_spawn_player_for_peer.rpc_id(peer_id, int(existing_peer_id), player.global_position, _get_player_color(int(existing_peer_id)))
 	for bot_id in _basic_casters.keys():
 		var caster := _basic_casters[bot_id] as Node3D
 		if caster != null:
@@ -155,17 +164,19 @@ func _request_world_state() -> void:
 	_send_active_spell_impacts(peer_id)
 	if not _players.has(peer_id):
 		var spawn_position := _get_spawn_position(_players.size())
-		_spawn_player_for_peer.rpc(peer_id, spawn_position)
+		_spawn_player_for_peer.rpc(peer_id, spawn_position, _assign_player_color(peer_id))
 
 
 @rpc("authority", "call_local", "reliable")
-func _spawn_player_for_peer(peer_id: int, spawn_position: Vector3) -> void:
+func _spawn_player_for_peer(peer_id: int, spawn_position: Vector3, player_color: Color = Color(0.18, 0.14, 0.24)) -> void:
 	if _players.has(peer_id):
 		return
 	var player := PlayerScene.instantiate()
 	player.name = "Player_%d" % peer_id
 	if player.has_method("setup_multiplayer"):
 		player.setup_multiplayer(peer_id, peer_id == multiplayer.get_unique_id())
+	if player.has_method("set_player_color"):
+		player.set_player_color(player_color)
 	player.position = spawn_position
 	_players_root.add_child(player)
 	_players[peer_id] = player
@@ -175,6 +186,7 @@ func _spawn_player_for_peer(peer_id: int, spawn_position: Vector3) -> void:
 
 
 func _on_peer_disconnected(peer_id: int) -> void:
+	_player_color_indices.erase(peer_id)
 	_despawn_player_for_peer.rpc(peer_id)
 
 
@@ -187,6 +199,28 @@ func _despawn_player_for_peer(peer_id: int) -> void:
 	if _player == player:
 		_player = null
 	_refresh_basic_caster_target()
+
+
+func _assign_player_color(peer_id: int) -> Color:
+	if _player_color_indices.has(peer_id):
+		return PLAYER_COLORS[int(_player_color_indices[peer_id])]
+	var used := {}
+	for value in _player_color_indices.values():
+		used[int(value)] = true
+	for i in range(PLAYER_COLORS.size()):
+		if not used.has(i):
+			_player_color_indices[peer_id] = i
+			return PLAYER_COLORS[i]
+	var fallback_index: int = abs(peer_id) % PLAYER_COLORS.size()
+	_player_color_indices[peer_id] = fallback_index
+	return PLAYER_COLORS[fallback_index]
+
+
+func _get_player_color(peer_id: int) -> Color:
+	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
+		return _assign_player_color(peer_id)
+	var index := int(_player_color_indices.get(peer_id, 0))
+	return PLAYER_COLORS[clampi(index, 0, PLAYER_COLORS.size() - 1)]
 
 
 func _get_spawn_position(index: int) -> Vector3:
@@ -339,7 +373,7 @@ func close_spell_creator_for_local_player() -> void:
 		else:
 			_server_set_peer_in_creator.rpc_id(1, false)
 	else:
-		_spawn_player_for_peer(peer_id, _get_spawn_position(_players.size()))
+		_spawn_player_for_peer(peer_id, _get_spawn_position(_players.size()), _assign_player_color(peer_id))
 
 
 @rpc("any_peer", "reliable")
@@ -361,7 +395,7 @@ func _set_peer_in_creator(peer_id: int, in_creator: bool) -> void:
 		if not _peers_in_creator.has(peer_id):
 			return
 		_peers_in_creator.erase(peer_id)
-		_spawn_player_for_peer.rpc(peer_id, _get_spawn_position(_players.size()))
+		_spawn_player_for_peer.rpc(peer_id, _get_spawn_position(_players.size()), _get_player_color(peer_id))
 
 
 func _show_spell_creator_overlay() -> void:

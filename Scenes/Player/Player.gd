@@ -99,6 +99,8 @@ var _remote_beam_light: OmniLight3D
 var _remote_beam_origin: Vector3
 var _remote_beam_target: Vector3
 var _remote_beam_last_update_time: float = 0.0
+var _player_color: Color = Color(0.18, 0.14, 0.24)
+var _body_material: StandardMaterial3D
 var _charging_sphere_spell: SpellDefinition
 var _charging_sphere_time: float = 0.0
 var _charging_sphere_paid_size: int = 0
@@ -123,6 +125,13 @@ func setup_multiplayer(peer_id: int, is_local_player: bool) -> void:
 	_is_local_player = is_local_player
 	set_multiplayer_authority(peer_id)
 	_remote_snapshots.clear()
+
+
+func set_player_color(color: Color) -> void:
+	_player_color = color
+	if _body_material != null:
+		_body_material.albedo_color = _player_color
+		_body_material.emission = _player_color
 
 
 func get_network_peer_id() -> int:
@@ -204,16 +213,19 @@ func _build_body() -> void:
 
 
 func _build_visible_mage() -> void:
-	var body_mat := StandardMaterial3D.new()
-	body_mat.albedo_color = Color(0.18, 0.14, 0.24)
-	body_mat.roughness = 0.8
+	_body_material = StandardMaterial3D.new()
+	_body_material.albedo_color = _player_color
+	_body_material.emission_enabled = true
+	_body_material.emission = _player_color
+	_body_material.emission_energy_multiplier = 0.12
+	_body_material.roughness = 0.8
 
 	var body := MeshInstance3D.new()
 	var body_mesh := CapsuleMesh.new()
 	body_mesh.radius = 0.32
 	body_mesh.height = 1.45
 	body.mesh = body_mesh
-	body.material_override = body_mat
+	body.material_override = _body_material
 	body.position.y = 0.8
 	add_child(body)
 

@@ -52,8 +52,13 @@ Online multiplayer uses Godot ENet networking.
     -Join connects as a client and requests the current world/player state.
     -Players are spawned by network peer ID so each connected player has a stable
      replicated player node.
+    -The server assigns each player the first available colour from a four-colour
+     pool: blue, red, green, then yellow. Colours stay with a peer while they are
+     temporarily in the spell creator and are freed when that peer disconnects.
     -The server-spawned NPC caster is replicated to clients. Its AI and combat logic
      run on the server, with position/health/blind state synced outward.
+    -NPC casters use a reserved dark magenta body and bright magenta label colour,
+     outside the player colour pool.
     -Each spawned NPC caster receives three random spells from the bot spell pool and
      cycles those spells while attacking.
     -Bot difficulty controls spell budget and casting cadence:
