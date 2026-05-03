@@ -350,7 +350,7 @@ func _get_world_hit(from: Vector3, to: Vector3) -> Dictionary:
 
 
 func _get_source_excludes() -> Array:
-	if _collision_grace > 0.0 and _source is CollisionObject3D:
+	if _source is CollisionObject3D:
 		return [_source]
 	return []
 
@@ -358,6 +358,8 @@ func _get_source_excludes() -> Array:
 func _apply_spell_hit_to_collider(collider: Object, hit_position: Vector3, hit_normal: Vector3) -> bool:
 	var damageable := _find_damageable_node(collider)
 	if damageable == null:
+		return false
+	if damageable == _source:
 		return false
 	# Lag compensation: re-check the hit against the target's rewound position.
 	# If the target has moved far enough since cast time that the projectile

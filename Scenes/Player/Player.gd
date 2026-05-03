@@ -25,6 +25,8 @@ const TEST_SPELL_PATH := "user://test_spell.tres"
 const CAMERA_OFFSET := Vector3(0.75, 0.25, 3.2)
 const CAMERA_LOOK_AHEAD := Vector3(0.0, 0.0, -8.0)
 const PUSH_RECOIL_SCALE := 0.55
+const PUSH_RECOIL_BASE_RADIUS := 2.4
+const PUSH_RECOIL_SIZE_RADIUS_SCALE := 0.35
 const PLAYER_WATER_TEST_PUSH := 8.0
 const DIRECT_GRAVITY_RADIUS := 3.0
 const NETWORK_SEND_RATE := 0.016
@@ -1424,6 +1426,14 @@ func _apply_push_recoil(spell: SpellDefinition, hit_position: Vector3, hit_norma
 	var force := spell.calculate_push_force(is_beam_tick) * PUSH_RECOIL_SCALE
 	if force <= 0.0:
 		return
+	var horizontal_offset := global_position - hit_position
+	horizontal_offset.y = 0.0
+	var distance := horizontal_offset.length()
+	var recoil_radius := PUSH_RECOIL_BASE_RADIUS + float(spell.spell_size) * PUSH_RECOIL_SIZE_RADIUS_SCALE
+	if distance > recoil_radius:
+		return
+	var falloff := 1.0 - clampf(distance / recoil_radius, 0.0, 1.0)
+	force *= falloff
 	var recoil_dir := global_position - hit_position
 	recoil_dir.y = 0.0
 	if recoil_dir.length_squared() < 0.01:
@@ -1507,6 +1517,8 @@ func _physics_process(delta: float) -> void:
 	var was_on_floor_at_start := is_on_floor()
 	if _server_state_lock_timer > 0.0:
 		_server_state_lock_timer = maxf(0.0, _server_state_lock_timer - delta)
+	if not _is_dead:
+		_decay_external_velocity(delta)
 	if not _is_local_player:
 		if multiplayer.multiplayer_peer != null and multiplayer.is_server():
 			if _is_dead:
@@ -1536,7 +1548,6 @@ func _physics_process(delta: float) -> void:
 		return
 	if _active_beam == null and _charging_sphere_spell == null:
 		_restore_mana(MANA_REGEN_PER_SECOND * delta)
-	_external_velocity = _external_velocity.move_toward(Vector3.ZERO, 12.0 * delta)
 	if _blind_timer > 0.0:
 		_blind_timer = maxf(0.0, _blind_timer - delta)
 		_update_blind_overlay()
@@ -1635,6 +1646,10 @@ func _absorb_landing_momentum(fall_distance: float) -> void:
 		return
 	velocity = Vector3.ZERO
 	_external_velocity = Vector3.ZERO
+
+
+func _decay_external_velocity(delta: float) -> void:
+	_external_velocity = _external_velocity.move_toward(Vector3.ZERO, 12.0 * delta)
 
 
 func _tick_server_respawn(delta: float) -> void:

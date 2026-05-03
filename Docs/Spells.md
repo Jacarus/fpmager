@@ -464,7 +464,10 @@ The base cost formula with multi-base support:
         For multiplayer testing, any Water hit gives players a small minimum shove,
         while Push-enabled Water scales that shove higher.
         Player-cast push spells also produce reduced caster recoil when the beam or
-        sphere impacts a target or surface, making Water useful for movement tests.
+        sphere impacts a nearby target or surface. Recoil falls off with distance,
+        so distant Water impacts do not move the caster.
+        Moving projectiles ignore their caster's own body; only confirmed nearby
+        impact recoil or lingering area effects can move the caster.
         The world includes a blue "PUSH TEST" rigid body near the NPC spawn. It reacts
         to any Water hit with a minimum physics impulse, and Push-enabled Water hits
         scale that impulse higher, so push can be tested independently of NPC movement.

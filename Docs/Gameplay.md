@@ -78,6 +78,8 @@ Online multiplayer uses Godot ENet networking.
     -Server combat state also includes external movement velocity, so authoritative
      Water push, caster recoil, and Void/Earth gravity impulses are applied on the
      owning client instead of only on the server copy.
+    -Server-side external movement velocity decays for client-owned players too, so
+     old push or gravity impulses are not rebroadcast by later combat events.
     -Server-owned physics test objects, such as the blue push test box, replicate
      their transform and velocity to clients after push/gravity impulses.
     -Projectile casts are requested by clients, spawned by the server through the
