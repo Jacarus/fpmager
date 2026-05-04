@@ -12,6 +12,7 @@ static func to_dict(spell: SpellDefinition) -> Dictionary:
 		"spell_size": spell.spell_size,
 		"spell_range": spell.spell_range,
 		"spell_speed": spell.spell_speed,
+		"wall_time": spell.wall_time,
 		"has_charging": spell.has_charging,
 		"burns": spell.burns,
 		"cools": spell.cools,
@@ -36,6 +37,7 @@ static func from_dict(data: Dictionary) -> SpellDefinition:
 	spell.spell_size = int(data.get("spell_size", 1))
 	spell.spell_range = int(data.get("spell_range", 1))
 	spell.spell_speed = int(data.get("spell_speed", 1))
+	spell.wall_time = int(data.get("wall_time", 4))
 	spell.has_charging = bool(data.get("has_charging", false))
 	spell.burns = bool(data.get("burns", false))
 	spell.cools = bool(data.get("cools", false))

@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://boss_caster"]
+
+[ext_resource type="Script" path="res://Scenes/NPC/BossCaster.gd" id="1_boss_caster"]
+
+[node name="BossCaster" type="Node3D"]
+script = ExtResource("1_boss_caster")

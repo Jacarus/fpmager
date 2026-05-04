@@ -20,8 +20,16 @@ Before hosting, Create opens host settings:
     -Bots: on/off
     -Number of bots: enabled only when Bots is on
     -Bot difficulty: Easy, Medium, Hard; enabled only when Bots is on
+    -Boss: on/off
+    -Boss health: enabled only when Boss is on
+    -Boss size: enabled only when Boss is on
+    -Ability cooldown: enabled only when Boss is on
+    -Boss speed: enabled only when Boss is on
+    -Boss respawns: enabled only when Boss is on
 When Bots is off, no NPC casters spawn. When Bots is on, the server spawns the
 chosen number of NPC casters.
+When Boss is on, the server spawns one Aether Colossus boss using the selected
+health, size, ability cooldown, movement speed, and respawn settings.
 Dedicated servers can change bot settings while running by appending commands to
 the server command file. Supported commands are:
     -status
@@ -140,6 +148,58 @@ Online multiplayer uses Godot ENet networking.
      instead of instantly passing through.
     -Fire/Water beam clashes stop both beams and create a larger Steam Clash cloud at
      the collision point.
+    -Boss NPCs can be spawned by script/server command with per-spawn settings.
+     A boss is a large, server-authoritative multi-part enemy. Its overall raid-style
+     health bar is replicated to every player through the world HUD.
+    -Boss parts are individually damageable. Each major part controls an ability:
+        Prism Arm: charges briefly, then fires five Light sphere projectiles toward
+        pressure points around the arena. These use the normal projectile path, so
+        players can see, dodge, and counter them with spell collisions.
+        Core: telegraphs a large ground circle before a boss-only Cataclysm AOE lands.
+        Gravity Arm: telegraphs multiple ground circles before Void/Earth Singularity
+        fields appear.
+        Anchor Feet: damageable movement component; destroying it stops boss movement.
+        Crown: command part for future phase/AI tuning.
+      Destroying a part disables the ability tied to that part.
+      Part max health is scaled from the boss's configured max health, so higher-health
+      boss spawns also make each component tougher.
+      Boss ground attacks are only placed outside the boss's own danger radius, so
+      Cataclysm and Gravity Wells are not chosen when they would land on the boss.
+      When the boss is defeated, pending boss attacks are cancelled. If respawn is
+      enabled, it returns after its respawn delay; otherwise it despawns after 5 seconds.
+    -Boss AI is server-authoritative. It scores live player targets by distance,
+     clustering, and target stickiness, then moves around the selected target while
+     trying to maintain a medium engagement range. It chases players who kite too far,
+     backs away from players who get too close, strafes during pressure windows, and
+     drifts back toward the arena center.
+    -Boss attack choice is weighted by target distance, player clustering, surviving
+     parts, cooldowns, and the previous attack. This makes it prefer Cataclysm against
+     clustered/near players, Gravity Wells against farther players, and Prism Split as
+     ranged pressure, while reducing immediate repeats.
+    -Boss abilities use boss-only spell definitions and are not available in the
+     player spell creator/loadout budget.
+    -Boss attacks that appear directly on the ground must create a visible countdown
+     telegraph first. The warning zone is replicated to clients before the
+     server-authoritative impact or lingering field is spawned.
+    -Scripts can call:
+        get_tree().current_scene.spawn_boss({
+            "display_name": "Aether Colossus",
+            "max_health": 2400,
+            "avatar_scale": 1.2,
+            "ability_cooldown_scale": 0.85,
+            "movement_speed_scale": 1.1,
+            "respawn_enabled": false,
+            "blind_volley_enabled": true,
+            "large_aoe_enabled": true,
+            "singularity_enabled": true
+        })
+      Dedicated servers also accept:
+        boss spawn health=2400 name=Aether_Colossus scale=1.2 cooldown=0.85 speed=1.1 respawn=off
+        boss despawn 0
+        boss status
+      After a defeated non-respawning boss despawns, running boss spawn again creates a
+      fresh boss. For local testing, use Play -> Create, enable Boss, choose
+      health/size/cooldown/speed/respawn, then Start Host.
 
 ##Spell creation##
 UI should dynamically update to show what the spell will look like in the characters hands / body (i.e. growing larger as its size is increased)

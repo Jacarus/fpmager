@@ -24,6 +24,10 @@ var _mesh_instance: MeshInstance3D
 var _material: StandardMaterial3D
 var _light: OmniLight3D
 var _label: Label3D
+var _has_blocking_plane: bool = false
+var _blocking_plane_point: Vector3 = Vector3.ZERO
+var _blocking_front_normal: Vector3 = Vector3.FORWARD
+var _blocking_back_margin: float = 0.35
 
 
 static func estimate_lifetime(spell: SpellDefinition) -> float:
@@ -37,6 +41,22 @@ static func estimate_lifetime(spell: SpellDefinition) -> float:
 	if spell.is_blind_spell():
 		lifetime = maxf(lifetime, 0.9)
 	return lifetime
+
+
+static func estimate_radius(spell: SpellDefinition) -> float:
+	if spell == null:
+		return 1.0
+	var effect := spell.get_complex_effect()
+	var area_score := 3
+	if not effect.is_empty():
+		var stats: Dictionary = effect["stats"]
+		area_score = int(stats.get("Area", area_score))
+	var radius := 0.7 + spell.spell_size * 0.18 + area_score * 0.16
+	if spell.is_gravity_spell():
+		radius *= 2.2
+	if spell.is_blind_spell():
+		radius = maxf(radius, spell.calculate_blind_radius())
+	return radius
 
 
 func initialize(spell: SpellDefinition, impact_position: Vector3, normal: Vector3 = Vector3.UP, source: Node = null, initial_age: float = 0.0) -> void:
@@ -86,6 +106,15 @@ func set_visual_only(value: bool) -> void:
 	_visual_only = value
 
 
+func set_blocking_plane(point: Vector3, front_normal: Vector3, back_margin: float = 0.35) -> void:
+	if front_normal.length_squared() <= 0.001:
+		return
+	_has_blocking_plane = true
+	_blocking_plane_point = point
+	_blocking_front_normal = front_normal.normalized()
+	_blocking_back_margin = maxf(0.0, back_margin)
+
+
 func _process(delta: float) -> void:
 	_age += delta
 	_damage_tick_timer -= delta
@@ -115,17 +144,14 @@ func _process(delta: float) -> void:
 		queue_free()
 
 
-func _calculate_radius(spell: SpellDefinition, effect: Dictionary) -> float:
-	var area_score := 3
-	if not effect.is_empty():
-		var stats: Dictionary = effect["stats"]
-		area_score = int(stats.get("Area", area_score))
-	var radius := 0.7 + spell.spell_size * 0.18 + area_score * 0.16
-	if spell.is_gravity_spell():
-		radius *= 2.2
-	if spell.is_blind_spell():
-		radius = maxf(radius, spell.calculate_blind_radius())
-	return radius
+func _get_current_effect_radius() -> float:
+	var t := clampf(_age / _lifetime, 0.0, 1.0)
+	var expand := lerpf(0.25, 1.0, ease(t, -1.5))
+	return _radius * expand
+
+
+func _calculate_radius(spell: SpellDefinition, _effect: Dictionary) -> float:
+	return estimate_radius(spell)
 
 
 func _calculate_lifetime(effect: Dictionary) -> float:
@@ -136,11 +162,16 @@ func _apply_blind_flash() -> void:
 	var duration := _spell.calculate_blind_duration(false)
 	if duration <= 0.0:
 		return
+	var current_radius := _get_current_effect_radius()
 	for damageable in _get_damageable_nodes(get_tree().current_scene):
+		if not _can_affect_damageable(damageable):
+			continue
 		var node_3d := damageable as Node3D
 		if node_3d == null:
 			continue
-		if node_3d.global_position.distance_to(global_position) > _radius:
+		if _is_blocked_behind_wall(node_3d.global_position):
+			continue
+		if node_3d.global_position.distance_to(global_position) > current_radius:
 			continue
 		if damageable.has_method("apply_blind"):
 			damageable.apply_blind(duration)
@@ -149,13 +180,17 @@ func _apply_blind_flash() -> void:
 func _apply_area_spell_tick() -> void:
 	if _spell == null:
 		return
-	var is_healing := _spell.is_healing_spell()
+	var current_radius := _get_current_effect_radius()
 	for damageable in _get_damageable_nodes(get_tree().current_scene):
+		if not _can_affect_damageable(damageable):
+			continue
 		var node_3d := damageable as Node3D
 		if node_3d == null:
 			continue
+		if _is_blocked_behind_wall(node_3d.global_position):
+			continue
 		var distance := node_3d.global_position.distance_to(global_position)
-		if distance > _radius:
+		if distance > current_radius:
 			continue
 		if _spell.is_blind_spell() and damageable.has_method("apply_blind"):
 			damageable.apply_blind(_spell.calculate_blind_duration(true))
@@ -173,10 +208,26 @@ func _get_damageable_nodes(root: Node) -> Array[Node]:
 
 
 func _collect_damageable_nodes(node: Node, results: Array[Node]) -> void:
+	if node == null or not is_instance_valid(node) or node.is_queued_for_deletion():
+		return
 	if node.has_method("apply_spell_hit"):
 		results.append(node)
 	for child in node.get_children():
 		_collect_damageable_nodes(child, results)
+
+
+func _can_affect_damageable(damageable: Node) -> bool:
+	if damageable == null or not is_instance_valid(damageable) or damageable.is_queued_for_deletion():
+		return false
+	if damageable.has_method("is_damageable") and not bool(damageable.is_damageable()):
+		return false
+	return true
+
+
+func _is_blocked_behind_wall(position: Vector3) -> bool:
+	if not _has_blocking_plane:
+		return false
+	return (position - _blocking_plane_point).dot(_blocking_front_normal) < -_blocking_back_margin
 
 
 func _create_effect_mesh(effect_name: String) -> Mesh:

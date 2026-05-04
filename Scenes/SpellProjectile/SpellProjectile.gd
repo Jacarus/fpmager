@@ -20,6 +20,15 @@ const ELEMENT_COLORS: Dictionary = {
 	"Light": Color(1.0, 1.0, 0.35),
 	"Void": Color(0.45, 0.1, 0.65),
 }
+const WALL_BASE_HEALTH := 24.0
+const WALL_INTENSITY_HEALTH := 12.0
+const WALL_SIZE_HEALTH := 8.0
+const WALL_SAME_TYPE_DAMAGE_SCALE := 0.25
+const WALL_OPPOSED_DAMAGE_SCALE := 1.65
+const WALL_MIN_DAMAGE := 1.0
+const WALL_CRACK_COUNT := 9
+const WALL_START_ALPHA := 0.86
+const WALL_END_ALPHA := 0.18
 
 var _velocity: Vector3 = Vector3.ZERO
 var _lifetime: float = 0.0
@@ -35,6 +44,16 @@ var _collision_grace: float = 0.08
 var _wave_phase_offset: float = 0.0
 var _is_authoritative: bool = true
 var _cast_server_time: float = 0.0
+var _wall_size: Vector3 = Vector3.ZERO
+var _wall_health: float = 0.0
+var _wall_max_health: float = 0.0
+var _wall_block_times: Dictionary = {}
+var _mesh_instance: MeshInstance3D
+var _material: StandardMaterial3D
+var _wall_cracks: Array[MeshInstance3D] = []
+var _wall_base_color: Color = Color.WHITE
+var _wall_physical_body: StaticBody3D
+var _wall_collision_shape: CollisionShape3D
 
 
 func initialize(spell: SpellDefinition, from: Vector3, direction: Vector3, source: Node = null, cast_server_time: float = -1.0) -> void:
@@ -51,8 +70,11 @@ func initialize(spell: SpellDefinition, from: Vector3, direction: Vector3, sourc
 	mat.emission_enabled = true
 	mat.emission = col
 	mat.emission_energy_multiplier = 1.2 + (spell.intensity - 1) * 0.28
+	_material = mat
+	_wall_base_color = col
 
 	var mesh_inst := MeshInstance3D.new()
+	_mesh_instance = mesh_inst
 	mesh_inst.material_override = mat
 	add_child(mesh_inst)
 
@@ -93,14 +115,23 @@ func initialize(spell: SpellDefinition, from: Vector3, direction: Vector3, sourc
 				1.2 + (spell.spell_size - 1) * 0.15,
 				0.1
 			) * _get_blend_visual_scale(spell)
+			_wall_size = mesh.size
+			_wall_max_health = _calculate_wall_health(spell)
+			_wall_health = _wall_max_health
 			mesh_inst.mesh = mesh
+			mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+			mat.albedo_color.a = WALL_START_ALPHA
+			mat.emission_energy_multiplier *= 0.75
 			_is_static = true
-			_max_lifetime = 4.0 + (spell.spell_range - 1) * 0.5
+			_max_lifetime = maxf(0.5, float(spell.wall_time))
 			global_position = _get_wall_position(from, direction)
 			_last_position = global_position
 			# Face back toward caster
 			if direction.length_squared() > 0.001:
 				look_at(from, Vector3.UP)
+			_build_wall_cracks()
+			_build_earth_wall_physics()
+			_update_wall_visuals()
 
 		_:
 			# Fallback sphere
@@ -122,6 +153,8 @@ func _process(delta: float) -> void:
 	if _lifetime >= _max_lifetime:
 		queue_free()
 		return
+	if is_spell_wall():
+		_update_wall_visuals()
 	if not _is_static:
 		var next_position := global_position + _velocity * delta
 		if not _is_authoritative:
@@ -139,6 +172,10 @@ func _process(delta: float) -> void:
 		if not hit.is_empty():
 			var hit_position := hit["position"] as Vector3
 			var hit_normal := hit["normal"] as Vector3
+			var wall := _find_spell_wall_node(hit.get("collider"))
+			if wall != null and wall != self:
+				_resolve_wall_block(wall, hit_position, hit_normal)
+				return
 			_apply_spell_hit_to_collider(hit.get("collider"), hit_position, hit_normal)
 			_apply_recoil_to_source(hit_position, hit_normal)
 			_spawn_impact(hit_position, hit_normal)
@@ -162,6 +199,94 @@ func is_spell_consumed() -> bool:
 	return _consumed
 
 
+func is_spell_wall() -> bool:
+	return _is_static and _spell != null and _spell.shape == "Wall"
+
+
+func is_physical_earth_wall() -> bool:
+	return is_spell_wall() and _spell.get_base_elements().has("Earth")
+
+
+func get_wall_health() -> float:
+	return _wall_health
+
+
+func get_wall_max_health() -> float:
+	return _wall_max_health
+
+
+func get_wall_segment_hit(from: Vector3, to: Vector3, incoming_radius: float) -> Dictionary:
+	if not is_spell_wall():
+		return {}
+	var local_from := to_local(from)
+	var local_to := to_local(to)
+	var local_delta := local_to - local_from
+	var half_extents := _wall_size * 0.5 + Vector3.ONE * maxf(0.02, incoming_radius)
+	var t_enter := 0.0
+	var t_exit := 1.0
+	var enter_axis := -1
+	var enter_sign := 0.0
+	for axis in range(3):
+		var start := _get_axis(local_from, axis)
+		var delta := _get_axis(local_delta, axis)
+		var min_value := -_get_axis(half_extents, axis)
+		var max_value := _get_axis(half_extents, axis)
+		if absf(delta) <= 0.0001:
+			if start < min_value or start > max_value:
+				return {}
+			continue
+		var inv_delta := 1.0 / delta
+		var t1 := (min_value - start) * inv_delta
+		var t2 := (max_value - start) * inv_delta
+		var axis_sign := -1.0
+		if t1 > t2:
+			var temp := t1
+			t1 = t2
+			t2 = temp
+			axis_sign = 1.0
+		if t1 > t_enter:
+			t_enter = t1
+			enter_axis = axis
+			enter_sign = axis_sign
+		t_exit = minf(t_exit, t2)
+		if t_enter > t_exit:
+			return {}
+	if t_exit < 0.0 or t_enter > 1.0:
+		return {}
+	var hit_t := clampf(t_enter, 0.0, 1.0)
+	var local_hit := local_from + local_delta * hit_t
+	var local_normal := _axis_vector(enter_axis, enter_sign)
+	if enter_axis < 0:
+		local_normal = Vector3.BACK if local_from.z < local_to.z else Vector3.FORWARD
+	return {
+		"position": to_global(local_hit),
+		"normal": global_transform.basis * local_normal,
+	}
+
+
+func apply_wall_block(incoming_spell: SpellDefinition, is_beam_tick: bool = false, block_key: String = "", block_interval: float = 0.0) -> Dictionary:
+	if not is_spell_wall() or incoming_spell == null:
+		return {}
+	if block_interval > 0.0 and block_key != "":
+		var now := Time.get_ticks_msec() / 1000.0
+		if now - float(_wall_block_times.get(block_key, -99.0)) < block_interval:
+			return {"damage": 0.0, "destroyed": false, "reaction_spell": _get_wall_reaction_spell(incoming_spell)}
+		_wall_block_times[block_key] = now
+	var incoming_damage := maxf(WALL_MIN_DAMAGE, float(incoming_spell.calculate_damage(is_beam_tick)))
+	var scale := _get_wall_damage_scale(incoming_spell)
+	var damage := maxf(WALL_MIN_DAMAGE, incoming_damage * scale)
+	_wall_health = maxf(0.0, _wall_health - damage)
+	_update_wall_visuals()
+	var destroyed := _wall_health <= 0.0
+	if destroyed:
+		_consume()
+	return {
+		"damage": damage,
+		"destroyed": destroyed,
+		"reaction_spell": _get_wall_reaction_spell(incoming_spell),
+	}
+
+
 func _check_spell_collision(next_position: Vector3) -> bool:
 	for node in get_tree().get_nodes_in_group("spell_projectile"):
 		if node == self or not is_instance_valid(node):
@@ -170,12 +295,32 @@ func _check_spell_collision(next_position: Vector3) -> bool:
 			continue
 		if node.is_spell_consumed():
 			continue
+		if node.has_method("is_spell_wall") and bool(node.is_spell_wall()):
+			var wall_hit: Dictionary = node.get_wall_segment_hit(global_position, next_position, _get_collision_radius())
+			if not wall_hit.is_empty():
+				_resolve_wall_block(node, wall_hit["position"] as Vector3, wall_hit["normal"] as Vector3)
+				return true
+			continue
 		var other_pos: Vector3 = node.global_position
 		var radius: float = _get_collision_radius() + node._get_collision_radius()
 		if _distance_to_segment(other_pos, global_position, next_position) <= radius:
 			_resolve_spell_collision(node, global_position.lerp(next_position, 0.5))
 			return true
 	return false
+
+
+func _resolve_wall_block(wall: Node3D, collision_point: Vector3, wall_normal: Vector3) -> void:
+	if _spell == null or wall == null or not wall.has_method("apply_wall_block"):
+		return
+	var outcome: Dictionary = wall.apply_wall_block(_spell)
+	var reaction_spell := outcome.get("reaction_spell") as SpellDefinition
+	if reaction_spell == null:
+		reaction_spell = _spell
+	var front_normal := -_velocity.normalized()
+	if front_normal.length_squared() <= 0.001:
+		front_normal = wall_normal.normalized()
+	_spawn_wall_block_impact(reaction_spell, collision_point, front_normal, wall.global_position)
+	_consume()
 
 
 func _resolve_spell_collision(other: Node3D, collision_point: Vector3) -> void:
@@ -350,7 +495,7 @@ func _get_world_hit(from: Vector3, to: Vector3) -> Dictionary:
 
 
 func _get_source_excludes() -> Array:
-	if _source is CollisionObject3D:
+	if is_instance_valid(_source) and _source is CollisionObject3D:
 		return [_source]
 	return []
 
@@ -359,7 +504,7 @@ func _apply_spell_hit_to_collider(collider: Object, hit_position: Vector3, hit_n
 	var damageable := _find_damageable_node(collider)
 	if damageable == null:
 		return false
-	if damageable == _source:
+	if is_instance_valid(_source) and damageable == _source:
 		return false
 	# Lag compensation: re-check the hit against the target's rewound position.
 	# If the target has moved far enough since cast time that the projectile
@@ -374,7 +519,7 @@ func _apply_spell_hit_to_collider(collider: Object, hit_position: Vector3, hit_n
 
 
 func _apply_recoil_to_source(hit_position: Vector3, hit_normal: Vector3) -> void:
-	if _source != null and _source.has_method("apply_spell_recoil"):
+	if is_instance_valid(_source) and _source.has_method("apply_spell_recoil"):
 		_source.apply_spell_recoil(_spell, hit_position, hit_normal, false)
 
 
@@ -382,6 +527,8 @@ func _find_damageable_node(value: Object) -> Node:
 	var node := value as Node
 	while node != null:
 		if node.has_method("apply_spell_hit"):
+			if node.has_method("is_damageable") and not bool(node.is_damageable()):
+				return null
 			return node
 		node = node.get_parent()
 	return null
@@ -400,6 +547,18 @@ func _spawn_impact_with_spell(spell: SpellDefinition, position: Vector3, normal:
 	var world := get_tree().current_scene
 	if _is_authoritative and multiplayer.multiplayer_peer != null and multiplayer.is_server() and world != null and world.has_method("broadcast_spell_impact"):
 		world.broadcast_spell_impact(spell, position, normal)
+
+
+func _spawn_wall_block_impact(spell: SpellDefinition, position: Vector3, front_normal: Vector3, wall_position: Vector3) -> void:
+	if spell == null:
+		return
+	var effect := SpellImpactEffectScript.new()
+	get_tree().current_scene.add_child(effect)
+	effect.initialize(spell, position, front_normal, _source)
+	effect.set_blocking_plane(wall_position, front_normal)
+	var world := get_tree().current_scene
+	if _is_authoritative and multiplayer.multiplayer_peer != null and multiplayer.is_server() and world != null and world.has_method("broadcast_spell_impact"):
+		world.broadcast_spell_impact(spell, position, front_normal)
 
 
 func _spawn_visual_impact(position: Vector3, normal: Vector3) -> void:
@@ -451,7 +610,140 @@ func _distance_to_segment(point: Vector3, a: Vector3, b: Vector3) -> float:
 func _get_collision_radius() -> float:
 	if _spell == null:
 		return 0.25
+	if is_spell_wall():
+		return maxf(_wall_size.x, _wall_size.y) * 0.5
 	return 0.25 + _spell.spell_size * 0.06
+
+
+func _find_spell_wall_node(value: Variant) -> Node3D:
+	var node := value as Node
+	while node != null:
+		if node.has_method("is_spell_wall") and bool(node.is_spell_wall()):
+			return node as Node3D
+		node = node.get_parent()
+	return null
+
+
+func _build_wall_cracks() -> void:
+	if not is_spell_wall():
+		return
+	var crack_material := StandardMaterial3D.new()
+	crack_material.albedo_color = Color(0.03, 0.02, 0.018, 0.92)
+	crack_material.emission_enabled = true
+	crack_material.emission = Color(0.08, 0.035, 0.02)
+	crack_material.emission_energy_multiplier = 0.18
+	crack_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	var crack_specs: Array[Dictionary] = [
+		{"pos": Vector3(-0.28, 0.12, -0.56), "size": Vector3(0.035, 0.48, 0.012), "rot": -0.55},
+		{"pos": Vector3(-0.16, -0.12, -0.56), "size": Vector3(0.03, 0.36, 0.012), "rot": 0.72},
+		{"pos": Vector3(0.1, 0.22, -0.56), "size": Vector3(0.028, 0.52, 0.012), "rot": 0.18},
+		{"pos": Vector3(0.31, -0.04, -0.56), "size": Vector3(0.035, 0.44, 0.012), "rot": -0.78},
+		{"pos": Vector3(-0.38, -0.34, -0.56), "size": Vector3(0.025, 0.34, 0.012), "rot": -0.08},
+		{"pos": Vector3(0.38, 0.35, -0.56), "size": Vector3(0.025, 0.32, 0.012), "rot": 0.88},
+		{"pos": Vector3(0.0, -0.38, -0.56), "size": Vector3(0.03, 0.5, 0.012), "rot": 1.24},
+		{"pos": Vector3(-0.02, 0.02, -0.56), "size": Vector3(0.04, 0.72, 0.014), "rot": -1.05},
+		{"pos": Vector3(0.22, -0.28, -0.56), "size": Vector3(0.028, 0.42, 0.012), "rot": 0.42},
+	]
+	for spec in crack_specs:
+		var crack := _create_wall_crack(spec, crack_material, -1.0)
+		add_child(crack)
+		_wall_cracks.append(crack)
+		var back_crack := _create_wall_crack(spec, crack_material, 1.0)
+		add_child(back_crack)
+		_wall_cracks.append(back_crack)
+
+
+func _create_wall_crack(spec: Dictionary, material: StandardMaterial3D, z_sign: float) -> MeshInstance3D:
+	var crack := MeshInstance3D.new()
+	var mesh := BoxMesh.new()
+	var size := spec.get("size", Vector3(0.03, 0.4, 0.012)) as Vector3
+	mesh.size = Vector3(size.x * _wall_size.x, size.y * _wall_size.y, size.z)
+	crack.mesh = mesh
+	crack.material_override = material
+	var pos := spec.get("pos", Vector3.ZERO) as Vector3
+	crack.position = Vector3(pos.x * _wall_size.x, pos.y * _wall_size.y, z_sign * _wall_size.z * 0.62)
+	crack.rotation.z = float(spec.get("rot", 0.0)) * z_sign
+	crack.visible = false
+	return crack
+
+
+func _build_earth_wall_physics() -> void:
+	if not is_physical_earth_wall():
+		return
+	_wall_physical_body = StaticBody3D.new()
+	_wall_physical_body.name = "EarthWallBody"
+	_wall_physical_body.collision_layer = 1
+	_wall_physical_body.collision_mask = 1
+	add_child(_wall_physical_body)
+
+	_wall_collision_shape = CollisionShape3D.new()
+	_wall_collision_shape.name = "EarthWallCollision"
+	var shape := BoxShape3D.new()
+	shape.size = Vector3(_wall_size.x, _wall_size.y, maxf(_wall_size.z, 0.35))
+	_wall_collision_shape.shape = shape
+	_wall_physical_body.add_child(_wall_collision_shape)
+
+
+func _update_wall_visuals() -> void:
+	if not is_spell_wall():
+		return
+	var health_ratio := clampf(_wall_health / maxf(_wall_max_health, 0.001), 0.0, 1.0)
+	var age_ratio := clampf(_lifetime / maxf(_max_lifetime, 0.001), 0.0, 1.0)
+	if _material != null:
+		var col := _wall_base_color
+		col.a = lerpf(WALL_START_ALPHA, WALL_END_ALPHA, age_ratio)
+		_material.albedo_color = col
+		_material.emission_energy_multiplier = (0.55 + health_ratio * 0.55) * (1.0 - age_ratio * 0.45)
+	var cracks_per_side := int(ceil((1.0 - health_ratio) * float(WALL_CRACK_COUNT)))
+	for i in range(_wall_cracks.size()):
+		var crack_index := int(floor(float(i) / 2.0))
+		_wall_cracks[i].visible = crack_index < cracks_per_side
+
+
+func _calculate_wall_health(spell: SpellDefinition) -> float:
+	if spell == null:
+		return WALL_BASE_HEALTH
+	var health := WALL_BASE_HEALTH
+	health += float(spell.intensity) * WALL_INTENSITY_HEALTH
+	health += float(spell.spell_size) * WALL_SIZE_HEALTH
+	var bases := spell.get_base_elements()
+	if bases.has("Earth"):
+		health *= 1.35
+	if bases.has("Void"):
+		health *= 1.2
+	if bases.has("Spirit") or bases.has("Light"):
+		health *= 0.9
+	if bases.size() > 1:
+		health *= 1.1
+	return maxf(WALL_BASE_HEALTH, health)
+
+
+func _get_wall_damage_scale(incoming_spell: SpellDefinition) -> float:
+	if incoming_spell == null or _spell == null:
+		return 1.0
+	if _shares_any_base(_spell, incoming_spell):
+		return WALL_SAME_TYPE_DAMAGE_SCALE
+	if not _find_opposing_pair(_spell, incoming_spell).is_empty():
+		return WALL_OPPOSED_DAMAGE_SCALE
+	var temp_delta := absf(_get_spell_temperature(_spell) - _get_spell_temperature(incoming_spell))
+	var density_delta := absf(_get_spell_density(_spell) - _get_spell_density(incoming_spell))
+	return clampf(0.85 + temp_delta * 0.035 + density_delta * 0.025, 0.85, 1.35)
+
+
+func _get_wall_reaction_spell(incoming_spell: SpellDefinition) -> SpellDefinition:
+	if incoming_spell == null or _spell == null:
+		return null
+	var opposing_pair := _find_opposing_pair(_spell, incoming_spell)
+	if opposing_pair.is_empty():
+		return null
+	return _create_reaction_spell(_spell, incoming_spell, opposing_pair)
+
+
+func _shares_any_base(a: SpellDefinition, b: SpellDefinition) -> bool:
+	for base in a.get_base_elements():
+		if b.get_base_elements().has(base):
+			return true
+	return false
 
 
 func _find_opposing_pair(a: SpellDefinition, b: SpellDefinition) -> Array[String]:
@@ -462,6 +754,30 @@ func _find_opposing_pair(a: SpellDefinition, b: SpellDefinition) -> Array[String
 			if opposing.has(base_b):
 				return [base_a, base_b]
 	return []
+
+
+func _get_axis(value: Vector3, axis: int) -> float:
+	match axis:
+		0:
+			return value.x
+		1:
+			return value.y
+		2:
+			return value.z
+		_:
+			return 0.0
+
+
+func _axis_vector(axis: int, sign: float) -> Vector3:
+	match axis:
+		0:
+			return Vector3(sign, 0.0, 0.0)
+		1:
+			return Vector3(0.0, sign, 0.0)
+		2:
+			return Vector3(0.0, 0.0, sign)
+		_:
+			return Vector3.ZERO
 
 
 func _get_opposition_power(spell: SpellDefinition, base: String) -> float:
@@ -525,6 +841,7 @@ func _duplicate_spell(source: SpellDefinition) -> SpellDefinition:
 	spell.spell_size = source.spell_size
 	spell.spell_range = source.spell_range
 	spell.spell_speed = source.spell_speed
+	spell.wall_time = source.wall_time
 	spell.has_charging = source.has_charging
 	spell.burns = source.burns
 	spell.cools = source.cools

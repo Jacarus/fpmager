@@ -4,6 +4,10 @@ const SpellNetworkCodecScript = preload("res://Scripts/SpellNetworkCodec.gd")
 
 
 func _init() -> void:
+	call_deferred("_run")
+
+
+func _run() -> void:
 	var spell := SpellDefinition.new()
 	spell.spell_name = "Steam Push"
 	spell.base_element = "Fire"
@@ -13,6 +17,7 @@ func _init() -> void:
 	spell.spell_size = 3
 	spell.spell_range = 4
 	spell.spell_speed = 5
+	spell.wall_time = 9
 	spell.has_charging = true
 	spell.burns = true
 	spell.cools = true
@@ -29,6 +34,7 @@ func _init() -> void:
 	_assert_eq(data["spell_name"], "Steam Push", "serializes spell name")
 	_assert_eq(data["base_weights"], {"Fire": 50.0, "Water": 50.0}, "serializes base weights")
 	_assert_eq(data["pull_strength"], 4, "serializes pull strength")
+	_assert_eq(data["wall_time"], 9, "serializes wall time")
 
 	var copy := SpellNetworkCodecScript.from_dict(data)
 	_assert_eq(copy.spell_name, spell.spell_name, "round-trips spell name")
@@ -39,6 +45,7 @@ func _init() -> void:
 	_assert_eq(copy.spell_size, spell.spell_size, "round-trips size")
 	_assert_eq(copy.spell_range, spell.spell_range, "round-trips range")
 	_assert_eq(copy.spell_speed, spell.spell_speed, "round-trips speed")
+	_assert_eq(copy.wall_time, spell.wall_time, "round-trips wall time")
 	_assert_eq(copy.has_charging, spell.has_charging, "round-trips charging")
 	_assert_eq(copy.burns, spell.burns, "round-trips burns")
 	_assert_eq(copy.cools, spell.cools, "round-trips cools")
@@ -55,9 +62,10 @@ func _init() -> void:
 	_assert_eq(fallback.spell_name, "Network Spell", "uses default network spell name")
 	_assert_eq(fallback.shape, "Sphere", "uses default shape")
 	_assert_eq(fallback.intensity, 1, "uses default intensity")
+	_assert_eq(fallback.wall_time, 4, "uses default wall time")
 
 	print("test_spell_network_codec: OK")
-	quit(0)
+	call_deferred("quit", 0)
 
 
 func _assert_eq(actual: Variant, expected: Variant, label: String) -> void:

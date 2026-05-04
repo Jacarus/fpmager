@@ -118,13 +118,112 @@ func _run_server_command(raw_command: String) -> void:
 	if command.is_empty() or command.begins_with("#"):
 		return
 	print("[ServerCommand] > %s" % command)
-	var result := GameSettings.apply_server_command(command)
+	var result := _try_run_world_command(command)
+	if not bool(result.get("handled", false)):
+		result = GameSettings.apply_server_command(command)
 	var message := str(result.get("message", ""))
 	if bool(result.get("ok", false)):
 		if message != "":
 			print("[ServerCommand] %s" % message)
 	else:
 		print("[ServerCommand] ERROR: %s" % message)
+
+
+func _try_run_world_command(command: String) -> Dictionary:
+	var parts := command.split(" ", false)
+	if parts.is_empty() or parts[0].to_lower() != "boss":
+		return {"handled": false}
+	var world := get_tree().current_scene
+	if world == null:
+		return {"handled": true, "ok": false, "message": "World is not loaded yet."}
+	if parts.size() < 2:
+		return {"handled": true, "ok": true, "message": _boss_command_help()}
+	var action := parts[1].to_lower()
+	match action:
+		"spawn":
+			if not world.has_method("spawn_boss"):
+				return {"handled": true, "ok": false, "message": "Current scene cannot spawn bosses."}
+			var settings := _parse_boss_settings(parts)
+			var ok := bool(world.spawn_boss(settings))
+			var spawn_message := "boss spawned %s" % str(settings) if ok else "Boss spawn rejected."
+			return {"handled": true, "ok": ok, "message": spawn_message}
+		"despawn", "remove":
+			if not world.has_method("despawn_boss"):
+				return {"handled": true, "ok": false, "message": "Current scene cannot despawn bosses."}
+			var boss_id := int(parts[2]) if parts.size() >= 3 and parts[2].is_valid_int() else 0
+			var ok := bool(world.despawn_boss(boss_id))
+			var despawn_message := "boss %d despawned" % boss_id if ok else "No boss %d exists." % boss_id
+			return {"handled": true, "ok": ok, "message": despawn_message}
+		"status":
+			return {"handled": true, "ok": true, "message": _get_boss_status_message(world)}
+		"help":
+			return {"handled": true, "ok": true, "message": _boss_command_help()}
+		_:
+			return {"handled": true, "ok": false, "message": _boss_command_help()}
+
+
+func _parse_boss_settings(parts: PackedStringArray) -> Dictionary:
+	var settings := {}
+	for i in range(2, parts.size()):
+		var token := parts[i]
+		var key := ""
+		var value := ""
+		if token.find("=") >= 0:
+			var pair := token.split("=", false, 1)
+			key = pair[0].to_lower()
+			value = pair[1]
+		elif token.is_valid_int() and not settings.has("max_health"):
+			key = "health"
+			value = token
+		else:
+			continue
+		match key:
+			"id", "boss_id":
+				if value.is_valid_int():
+					settings["boss_id"] = int(value)
+			"health", "max_health":
+				if value.is_valid_int():
+					settings["max_health"] = maxi(1, int(value))
+			"scale", "avatar_scale":
+				if value.is_valid_float():
+					settings["avatar_scale"] = maxf(0.35, float(value))
+			"cooldown", "cooldown_scale", "ability_cooldown_scale":
+				if value.is_valid_float():
+					settings["ability_cooldown_scale"] = maxf(0.25, float(value))
+			"speed", "move_speed", "movement_speed", "movement_speed_scale":
+				if value.is_valid_float():
+					settings["movement_speed_scale"] = maxf(0.25, float(value))
+			"respawn", "respawns", "respawn_enabled":
+				settings["respawn_enabled"] = _parse_bool(value)
+			"respawn_delay":
+				if value.is_valid_float():
+					settings["respawn_delay"] = maxf(0.1, float(value))
+			"despawn_delay":
+				if value.is_valid_float():
+					settings["despawn_delay"] = maxf(0.1, float(value))
+			"name", "display_name":
+				settings["display_name"] = value.replace("_", " ")
+			"blind":
+				settings["blind_volley_enabled"] = value.to_lower() not in ["0", "false", "off", "no"]
+			"aoe":
+				settings["large_aoe_enabled"] = value.to_lower() not in ["0", "false", "off", "no"]
+			"gravity", "singularity":
+				settings["singularity_enabled"] = value.to_lower() not in ["0", "false", "off", "no"]
+	return settings
+
+
+func _parse_bool(value: String) -> bool:
+	return value.to_lower() not in ["0", "false", "off", "no", "disabled"]
+
+
+func _get_boss_status_message(world: Node) -> String:
+	if world.has_method("get_boss_count"):
+		return "boss_count=%d" % int(world.get_boss_count())
+	return "boss status unavailable"
+
+
+func _boss_command_help() -> String:
+	return "Commands: boss spawn [health] [name=Aether_Colossus] [scale=1.0] [cooldown=1.0] [speed=1.0] [respawn=off] [blind=on] [aoe=on] [gravity=on], boss despawn [id], boss status"
 
 
 func _on_peer_connected(id: int) -> void:

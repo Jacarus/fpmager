@@ -35,6 +35,10 @@ const REMOTE_SNAPSHOT_LIMIT := 24
 const REMOTE_EXTRAPOLATION_LIMIT := 0.2
 const REMOTE_SNAP_DISTANCE := 4.0
 const KILL_ZONE_Y := -12.0
+const BURN_DURATION := 2.4
+const BURN_TICK_INTERVAL := 0.75
+const BURN_DAMAGE_SCALE := 0.35
+const DEATH_ANIMATION_DURATION := 0.85
 const ELEMENT_COLORS: Dictionary = {
 	"Fire": Color(1.0, 0.35, 0.05),
 	"Water": Color(0.1, 0.55, 1.0),
@@ -74,6 +78,9 @@ var _mana: float = MAX_MANA
 var _external_velocity: Vector3 = Vector3.ZERO
 var _blind_timer: float = 0.0
 var _blind_duration: float = 0.0
+var _burn_timer: float = 0.0
+var _burn_tick_timer: float = 0.0
+var _burn_tick_damage: int = 0
 var _is_dead: bool = false
 var _respawn_timer: float = 0.0
 var _kill_zone_respawn_timer: float = -1.0
@@ -105,7 +112,15 @@ var _remote_beam_origin: Vector3
 var _remote_beam_target: Vector3
 var _remote_beam_last_update_time: float = 0.0
 var _player_color: Color = Color(0.18, 0.14, 0.24)
+var _visual_root: Node3D
+var _body_mesh: MeshInstance3D
+var _hand_mesh: MeshInstance3D
 var _body_material: StandardMaterial3D
+var _hand_material: StandardMaterial3D
+var _death_burst: MeshInstance3D
+var _death_burst_material: StandardMaterial3D
+var _death_anim_time: float = 0.0
+var _death_anim_active: bool = false
 var _charging_sphere_spell: SpellDefinition
 var _charging_sphere_time: float = 0.0
 var _charging_sphere_paid_size: int = 0
@@ -137,10 +152,17 @@ func set_player_color(color: Color) -> void:
 	if _body_material != null:
 		_body_material.albedo_color = _player_color
 		_body_material.emission = _player_color
+	if _death_burst_material != null:
+		_death_burst_material.albedo_color = Color(_player_color.r, _player_color.g, _player_color.b, _death_burst_material.albedo_color.a)
+		_death_burst_material.emission = _player_color
 
 
 func get_network_peer_id() -> int:
 	return _network_peer_id
+
+
+func is_combat_targetable() -> bool:
+	return not _is_dead and not is_queued_for_deletion()
 
 
 func _ready() -> void:
@@ -180,6 +202,7 @@ func _process(delta: float) -> void:
 	_tick_remote_beam_visual()
 	if not _is_local_player:
 		_update_remote_visual_transform(delta)
+	_update_death_animation(delta)
 
 
 func _tick_remote_beam_visual() -> void:
@@ -218,12 +241,17 @@ func _build_body() -> void:
 
 
 func _build_visible_mage() -> void:
+	_visual_root = Node3D.new()
+	_visual_root.name = "MageVisual"
+	add_child(_visual_root)
+
 	_body_material = StandardMaterial3D.new()
 	_body_material.albedo_color = _player_color
 	_body_material.emission_enabled = true
 	_body_material.emission = _player_color
 	_body_material.emission_energy_multiplier = 0.12
 	_body_material.roughness = 0.8
+	_body_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 
 	var body := MeshInstance3D.new()
 	var body_mesh := CapsuleMesh.new()
@@ -232,11 +260,14 @@ func _build_visible_mage() -> void:
 	body.mesh = body_mesh
 	body.material_override = _body_material
 	body.position.y = 0.8
-	add_child(body)
+	_visual_root.add_child(body)
+	_body_mesh = body
 
 	var hand_mat := StandardMaterial3D.new()
 	hand_mat.albedo_color = Color(0.55, 0.46, 0.38)
 	hand_mat.roughness = 0.65
+	hand_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	_hand_material = hand_mat
 
 	var hand := MeshInstance3D.new()
 	var hand_mesh := SphereMesh.new()
@@ -246,6 +277,26 @@ func _build_visible_mage() -> void:
 	hand.material_override = hand_mat
 	hand.position = _cast_origin.position
 	_head.add_child(hand)
+	_hand_mesh = hand
+
+	_death_burst_material = StandardMaterial3D.new()
+	_death_burst_material.albedo_color = Color(_player_color.r, _player_color.g, _player_color.b, 0.0)
+	_death_burst_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	_death_burst_material.emission_enabled = true
+	_death_burst_material.emission = _player_color
+	_death_burst_material.emission_energy_multiplier = 0.0
+	_death_burst_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+
+	_death_burst = MeshInstance3D.new()
+	_death_burst.name = "DeathBurst"
+	var burst_mesh := SphereMesh.new()
+	burst_mesh.radius = 0.45
+	burst_mesh.height = 0.9
+	_death_burst.mesh = burst_mesh
+	_death_burst.material_override = _death_burst_material
+	_death_burst.position.y = 0.9
+	_death_burst.visible = false
+	add_child(_death_burst)
 
 
 func _build_hud() -> void:
@@ -684,9 +735,10 @@ func _get_spell_output_text(spell: SpellDefinition) -> String:
 	var push_suffix := " + %.1f push" % spell.calculate_push_force(false) if spell.calculate_push_force(false) > 0.0 else ""
 	var gravity_suffix := " + %.1f gravity" % spell.calculate_gravity_force(0.0, 3.0, false) if spell.calculate_gravity_force(0.0, 3.0, false) > 0.0 else ""
 	var blind_suffix := " + %.1fs blind" % spell.calculate_blind_duration(false) if spell.calculate_blind_duration(false) > 0.0 else ""
+	var wall_suffix := " + %ds wall" % spell.wall_time if spell.shape == "Wall" else ""
 	if spell.is_healing_spell():
-		return ("%d/tick heal" % spell.calculate_healing(true) if spell.shape == "Beam" else "%d heal" % spell.calculate_healing()) + push_suffix + gravity_suffix + blind_suffix
-	return ("%d/tick" % spell.calculate_damage(true) if spell.shape == "Beam" else "%d dmg" % spell.calculate_damage()) + push_suffix + gravity_suffix + blind_suffix
+		return ("%d/tick heal" % spell.calculate_healing(true) if spell.shape == "Beam" else "%d heal" % spell.calculate_healing()) + push_suffix + gravity_suffix + blind_suffix + wall_suffix
+	return ("%d/tick" % spell.calculate_damage(true) if spell.shape == "Beam" else "%d dmg" % spell.calculate_damage()) + push_suffix + gravity_suffix + blind_suffix + wall_suffix
 
 
 func _try_cast_slot(slot_index: int) -> void:
@@ -835,7 +887,7 @@ func _update_beam() -> void:
 	_beam_light.global_position = visible_target
 	_broadcast_beam_update(origin, visible_target)
 
-	if has_hit and not beam_blocked_by_spell and length >= target_length - 0.05 and _beam_impact_timer <= 0.0:
+	if has_hit and not beam_blocked_by_spell and _find_spell_wall_node(hit.get("collider")) == null and length >= target_length - 0.05 and _beam_impact_timer <= 0.0:
 		if _is_network_client():
 			_server_beam_tick.rpc_id(1, SpellNetworkCodecScript.to_dict(_active_beam_spell), origin, direction)
 		else:
@@ -863,6 +915,15 @@ func _get_beam_propagation_speed(spell_speed: int) -> float:
 
 func _get_beam_source_key() -> String:
 	return "player:%d" % _network_peer_id
+
+
+func _find_spell_wall_node(value: Variant) -> Node:
+	var node := value as Node
+	while node != null:
+		if node.has_method("is_spell_wall") and bool(node.is_spell_wall()):
+			return node
+		node = node.get_parent()
+	return null
 
 
 func _broadcast_beam_start(spell: SpellDefinition) -> void:
@@ -1048,10 +1109,11 @@ func _get_spell_color(spell: SpellDefinition) -> Color:
 	return color / total_weight
 
 
-func _spawn_spell_impact(spell: SpellDefinition, position: Vector3, normal: Vector3, broadcast_to_clients: bool = true) -> void:
+func _spawn_spell_impact(spell: SpellDefinition, position: Vector3, normal: Vector3, broadcast_to_clients: bool = true, visual_only: bool = false) -> void:
 	var effect := SpellImpactEffectScript.new()
 	get_tree().current_scene.add_child(effect)
 	effect.initialize(spell, position, normal, self)
+	effect.set_visual_only(visual_only)
 	var world := get_tree().current_scene
 	if broadcast_to_clients and multiplayer.multiplayer_peer != null and multiplayer.is_server() and world != null and world.has_method("broadcast_spell_impact"):
 		world.broadcast_spell_impact(spell, position, normal)
@@ -1117,6 +1179,8 @@ func _server_beam_tick(spell_data: Dictionary, origin: Vector3, direction: Vecto
 		var beam_target: Vector3 = world.get_registered_beam_target(_get_beam_source_key(), hit_position)
 		if origin.distance_to(beam_target) + 0.05 < origin.distance_to(hit_position):
 			return
+	if _find_spell_wall_node(hit.get("collider")) != null:
+		return
 	_apply_spell_hit_to_collider(hit.get("collider"), spell, hit_position, hit_normal, true)
 	_apply_push_recoil(spell, hit_position, hit_normal, true)
 	_spawn_spell_impact(spell, hit_position, hit_normal)
@@ -1162,7 +1226,8 @@ func _client_apply_self_effect(spell_data: Dictionary, source_peer_id: int) -> v
 
 func _apply_self_effect_local(spell: SpellDefinition) -> void:
 	_heal(spell.calculate_healing(false))
-	_spawn_spell_impact(spell, global_position + Vector3.UP * 0.7, Vector3.UP, false)
+	var visual_only := multiplayer.multiplayer_peer != null and not multiplayer.is_server()
+	_spawn_spell_impact(spell, global_position + Vector3.UP * 0.7, Vector3.UP, false, visual_only)
 
 
 func _find_network_player(peer_id: int) -> Node:
@@ -1190,6 +1255,8 @@ func _find_damageable_node(value: Object) -> Node:
 	var node := value as Node
 	while node != null:
 		if node.has_method("apply_spell_hit"):
+			if node.has_method("is_damageable") and not bool(node.is_damageable()):
+				return null
 			return node
 		node = node.get_parent()
 	return null
@@ -1283,6 +1350,7 @@ func _create_charged_sphere_spell() -> SpellDefinition:
 	spell.spell_size = _get_charged_sphere_size()
 	spell.spell_range = _charging_sphere_spell.spell_range
 	spell.spell_speed = _charging_sphere_spell.spell_speed
+	spell.wall_time = _charging_sphere_spell.wall_time
 	spell.has_charging = _charging_sphere_spell.has_charging
 	spell.burns = _charging_sphere_spell.burns
 	spell.cools = _charging_sphere_spell.cools
@@ -1353,6 +1421,10 @@ func _update_mana_hud() -> void:
 func apply_spell_hit(spell: SpellDefinition, _hit_position: Vector3, _hit_normal: Vector3, is_beam_tick: bool = false) -> void:
 	if spell == null or _is_dead:
 		return
+	if spell.cools:
+		_clear_burn()
+	if spell.burns and not spell.is_healing_spell():
+		_apply_burn(spell, is_beam_tick)
 	if spell.is_blind_spell():
 		apply_blind(spell.calculate_blind_duration(is_beam_tick))
 	_apply_pushback(spell, _hit_position, _hit_normal, is_beam_tick)
@@ -1388,6 +1460,38 @@ func _take_damage(amount: int) -> void:
 	_update_health_hud()
 	if _health <= 0:
 		_die()
+
+
+func _apply_burn(spell: SpellDefinition, is_beam_tick: bool) -> void:
+	var damage_basis: int = spell.calculate_damage(is_beam_tick)
+	var tick_damage: int = maxi(1, int(round(float(damage_basis) * BURN_DAMAGE_SCALE)))
+	_burn_timer = maxf(_burn_timer, BURN_DURATION)
+	_burn_tick_damage = maxi(_burn_tick_damage, tick_damage)
+	if _burn_tick_timer <= 0.0:
+		_burn_tick_timer = BURN_TICK_INTERVAL
+
+
+func _clear_burn() -> void:
+	_burn_timer = 0.0
+	_burn_tick_timer = 0.0
+	_burn_tick_damage = 0
+
+
+func _tick_burn_status(delta: float) -> bool:
+	if _burn_timer <= 0.0 or _burn_tick_damage <= 0 or _is_dead:
+		_clear_burn()
+		return false
+	_burn_timer = maxf(0.0, _burn_timer - delta)
+	_burn_tick_timer -= delta
+	if _burn_tick_timer > 0.0:
+		if _burn_timer <= 0.0:
+			_clear_burn()
+		return false
+	_burn_tick_timer = BURN_TICK_INTERVAL
+	_take_damage(_burn_tick_damage)
+	if _burn_timer <= 0.0 or _is_dead:
+		_clear_burn()
+	return true
 
 
 func _heal(amount: int) -> void:
@@ -1468,10 +1572,98 @@ func _update_health_hud() -> void:
 		_health_label.text = "Health  %d / %d" % [_health, MAX_HEALTH]
 
 
+func _tick_blind_timer(delta: float, update_overlay: bool) -> void:
+	if _blind_timer <= 0.0:
+		return
+	_blind_timer = maxf(0.0, _blind_timer - delta)
+	if _blind_timer <= 0.0:
+		_blind_duration = 0.0
+	if update_overlay:
+		_update_blind_overlay()
+
+
+func _start_death_animation() -> void:
+	_death_anim_time = 0.0
+	_death_anim_active = true
+	if _body_mesh != null:
+		_body_mesh.visible = true
+	if _hand_mesh != null:
+		_hand_mesh.visible = true
+	if _death_burst != null:
+		_death_burst.visible = true
+		_death_burst.scale = Vector3.ONE * 0.1
+
+
+func _reset_death_animation() -> void:
+	_death_anim_time = 0.0
+	_death_anim_active = false
+	if _visual_root != null:
+		_visual_root.position = Vector3.ZERO
+		_visual_root.rotation = Vector3.ZERO
+		_visual_root.scale = Vector3.ONE
+	if _body_mesh != null:
+		_body_mesh.visible = true
+	if _hand_mesh != null:
+		_hand_mesh.visible = true
+		_hand_mesh.scale = Vector3.ONE
+	if _body_material != null:
+		var body_col := _player_color
+		body_col.a = 1.0
+		_body_material.albedo_color = body_col
+		_body_material.emission = _player_color
+		_body_material.emission_energy_multiplier = 0.12
+	if _hand_material != null:
+		_hand_material.albedo_color = Color(0.55, 0.46, 0.38, 1.0)
+	if _death_burst != null:
+		_death_burst.visible = false
+		_death_burst.scale = Vector3.ONE * 0.1
+	if _death_burst_material != null:
+		_death_burst_material.albedo_color = Color(_player_color.r, _player_color.g, _player_color.b, 0.0)
+		_death_burst_material.emission_energy_multiplier = 0.0
+
+
+func _update_death_animation(delta: float) -> void:
+	if not _death_anim_active:
+		return
+	_death_anim_time = minf(_death_anim_time + delta, DEATH_ANIMATION_DURATION)
+	var t := clampf(_death_anim_time / DEATH_ANIMATION_DURATION, 0.0, 1.0)
+	var slump := ease(t, -1.6)
+	var fade := 1.0 - t
+	if _visual_root != null:
+		_visual_root.rotation.z = lerpf(0.0, deg_to_rad(82.0), slump)
+		_visual_root.rotation.x = lerpf(0.0, deg_to_rad(-14.0), slump)
+		_visual_root.position = Vector3(0.0, lerpf(0.0, -0.34, slump), 0.0)
+		_visual_root.scale = Vector3.ONE * lerpf(1.0, 0.82, t)
+	if _hand_mesh != null:
+		_hand_mesh.scale = Vector3.ONE * lerpf(1.0, 0.25, t)
+	if _body_material != null:
+		var body_col := _player_color
+		body_col.a = lerpf(1.0, 0.12, t)
+		_body_material.albedo_color = body_col
+		_body_material.emission_energy_multiplier = lerpf(0.12, 1.3, 1.0 - absf(t - 0.22) / 0.22) if t <= 0.44 else lerpf(0.32, 0.0, (t - 0.44) / 0.56)
+	if _hand_material != null:
+		_hand_material.albedo_color = Color(0.55, 0.46, 0.38, lerpf(1.0, 0.0, t))
+	if _death_burst != null:
+		_death_burst.scale = Vector3.ONE * lerpf(0.1, 2.1, ease(t, -2.0))
+	if _death_burst_material != null:
+		var burst_alpha := sin(t * PI) * 0.42
+		_death_burst_material.albedo_color = Color(_player_color.r, _player_color.g, _player_color.b, burst_alpha)
+		_death_burst_material.emission_energy_multiplier = sin(t * PI) * 1.6
+	if _death_anim_time >= DEATH_ANIMATION_DURATION:
+		_death_anim_active = false
+		if _body_mesh != null:
+			_body_mesh.visible = false
+		if _hand_mesh != null:
+			_hand_mesh.visible = false
+		if _death_burst != null:
+			_death_burst.visible = false
+
+
 func _die() -> void:
 	if _is_dead:
 		return
 	_is_dead = true
+	_start_death_animation()
 	_respawn_timer = RESPAWN_DELAY
 	_cancel_charged_sphere()
 	_stop_beam()
@@ -1479,6 +1671,7 @@ func _die() -> void:
 	_external_velocity = Vector3.ZERO
 	_blind_timer = 0.0
 	_blind_duration = 0.0
+	_clear_burn()
 	_update_blind_overlay()
 	if _death_label != null:
 		_death_label.visible = true
@@ -1487,6 +1680,7 @@ func _die() -> void:
 
 func _respawn() -> void:
 	_is_dead = false
+	_reset_death_animation()
 	_kill_zone_respawn_timer = -1.0
 	_health = MAX_HEALTH
 	_mana = MAX_MANA
@@ -1504,6 +1698,7 @@ func _respawn() -> void:
 	_server_state_lock_timer = 0.35
 	_blind_timer = 0.0
 	_blind_duration = 0.0
+	_clear_burn()
 	_update_blind_overlay()
 	_update_health_hud()
 	_update_mana_hud()
@@ -1525,6 +1720,9 @@ func _physics_process(delta: float) -> void:
 				_tick_server_respawn(delta)
 			else:
 				_restore_mana(MANA_REGEN_PER_SECOND * delta)
+				_tick_blind_timer(delta, false)
+				if _tick_burn_status(delta):
+					_broadcast_combat_state()
 		return
 	if _cast_timer > 0.0:
 		_cast_timer -= delta
@@ -1548,9 +1746,9 @@ func _physics_process(delta: float) -> void:
 		return
 	if _active_beam == null and _charging_sphere_spell == null:
 		_restore_mana(MANA_REGEN_PER_SECOND * delta)
-	if _blind_timer > 0.0:
-		_blind_timer = maxf(0.0, _blind_timer - delta)
-		_update_blind_overlay()
+	_tick_blind_timer(delta, true)
+	if _tick_burn_status(delta) and multiplayer.multiplayer_peer != null and multiplayer.is_server():
+		_broadcast_combat_state()
 
 	if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 		_cancel_charged_sphere()
@@ -1781,9 +1979,14 @@ func _apply_combat_state(
 	pos: Vector3,
 	external_velocity: Vector3
 ) -> void:
+	var was_dead := _is_dead
 	_health = health
 	_mana = mana
 	_is_dead = is_dead
+	if _is_dead and not was_dead:
+		_start_death_animation()
+	elif not _is_dead and was_dead:
+		_reset_death_animation()
 	_respawn_timer = respawn_timer
 	_kill_zone_respawn_timer = -1.0
 	_blind_timer = blind_timer

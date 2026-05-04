@@ -1,6 +1,7 @@
 extends Node
 
 signal bot_settings_changed
+signal boss_settings_changed
 signal fullscreen_changed(enabled: bool)
 
 const MIN_BOT_COUNT := 0
@@ -10,6 +11,12 @@ const DIFFICULTIES := ["Easy", "Medium", "Hard"]
 var bots_enabled: bool = true
 var bot_count: int = 1
 var bot_difficulty: String = "Medium"
+var boss_enabled: bool = false
+var boss_max_health: int = 1800
+var boss_avatar_scale: float = 1.0
+var boss_ability_cooldown_scale: float = 1.0
+var boss_movement_speed_scale: float = 1.0
+var boss_respawn_enabled: bool = false
 
 
 func has_window_display() -> bool:
@@ -48,6 +55,54 @@ func set_bot_settings(enabled: bool, count: int = bot_count, difficulty: String 
 	if changed:
 		bot_settings_changed.emit()
 	return changed
+
+
+func set_boss_settings(
+	enabled: bool,
+	max_health: int = boss_max_health,
+	avatar_scale: float = boss_avatar_scale,
+	ability_cooldown_scale: float = boss_ability_cooldown_scale,
+	movement_speed_scale: float = boss_movement_speed_scale,
+	respawn_enabled: bool = boss_respawn_enabled
+) -> bool:
+	var normalized_health := maxi(100, max_health)
+	var normalized_scale := clampf(avatar_scale, 0.5, 2.5)
+	var normalized_cooldown := clampf(ability_cooldown_scale, 0.25, 3.0)
+	var normalized_move_speed := clampf(movement_speed_scale, 0.25, 3.0)
+	var changed := (
+		boss_enabled != enabled
+		or boss_max_health != normalized_health
+		or not is_equal_approx(boss_avatar_scale, normalized_scale)
+		or not is_equal_approx(boss_ability_cooldown_scale, normalized_cooldown)
+		or not is_equal_approx(boss_movement_speed_scale, normalized_move_speed)
+		or boss_respawn_enabled != respawn_enabled
+	)
+	boss_enabled = enabled
+	boss_max_health = normalized_health
+	boss_avatar_scale = normalized_scale
+	boss_ability_cooldown_scale = normalized_cooldown
+	boss_movement_speed_scale = normalized_move_speed
+	boss_respawn_enabled = respawn_enabled
+	if changed:
+		boss_settings_changed.emit()
+	return changed
+
+
+func get_boss_spawn_settings() -> Dictionary:
+	return {
+		"boss_id": 0,
+		"display_name": "Aether Colossus",
+		"max_health": boss_max_health,
+		"avatar_scale": boss_avatar_scale,
+		"ability_cooldown_scale": boss_ability_cooldown_scale,
+		"movement_speed_scale": boss_movement_speed_scale,
+		"respawn_enabled": boss_respawn_enabled,
+		"respawn_delay": 10.0,
+		"despawn_delay": 5.0,
+		"blind_volley_enabled": true,
+		"large_aoe_enabled": true,
+		"singularity_enabled": true,
+	}
 
 
 func apply_server_command(command: String) -> Dictionary:
