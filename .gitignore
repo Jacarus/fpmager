@@ -29,6 +29,7 @@ dist/
 # Runtime/user data
 user://
 server_commands.txt
+local-server-commands.txt
 *.log
 
 # OS/editor/agent-local noise

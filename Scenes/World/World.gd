@@ -50,6 +50,8 @@ var _predicted_projectile_echoes: Array[Dictionary] = []
 var _active_beam_segments: Dictionary = {}
 var _beam_collision_impacts: Dictionary = {}
 var _beam_clash_points: Dictionary = {}
+var _world_state_retry_timer: float = 0.0
+var _world_state_request_cooldown: float = 0.0
 
 
 func _ready() -> void:
@@ -76,6 +78,9 @@ func _process(_delta: float) -> void:
 		_prune_expired_spell_impacts()
 	else:
 		_prune_predicted_projectile_echoes()
+		if _world_state_request_cooldown > 0.0:
+			_world_state_request_cooldown -= _delta
+		_retry_world_state_request(_delta)
 	_prune_invalid_bosses()
 	_prune_stale_beam_segments()
 
@@ -89,11 +94,32 @@ func _setup_multiplayer_world() -> void:
 		_spawn_configured_bots()
 		_spawn_configured_boss()
 	else:
-		_request_world_state.rpc_id(1)
+		_request_world_state_from_server()
 
 
 func _is_dedicated_server() -> bool:
 	return DedicatedServer.is_active()
+
+
+func _request_world_state_from_server() -> void:
+	if multiplayer.multiplayer_peer == null or multiplayer.is_server():
+		return
+	if _world_state_request_cooldown > 0.0:
+		return
+	_world_state_request_cooldown = 1.0
+	_world_state_retry_timer = 1.0
+	_request_world_state.rpc_id(1, multiplayer.get_unique_id())
+
+
+func _retry_world_state_request(delta: float) -> void:
+	if multiplayer.multiplayer_peer == null or multiplayer.is_server():
+		return
+	if _player != null:
+		return
+	_world_state_retry_timer -= delta
+	if _world_state_retry_timer > 0.0:
+		return
+	_request_world_state_from_server()
 
 
 func _build_environment() -> void:
@@ -173,10 +199,24 @@ func _spawn_single_player() -> void:
 
 
 @rpc("any_peer", "reliable")
-func _request_world_state() -> void:
+func _request_world_state(requested_peer_id: int = 0) -> void:
 	if not multiplayer.is_server():
 		return
 	var peer_id := multiplayer.get_remote_sender_id()
+	if peer_id <= 0 and requested_peer_id > 1:
+		peer_id = requested_peer_id
+	if peer_id <= 1:
+		print("[World] Ignoring world-state request with invalid peer id: ", peer_id)
+		return
+	print("[World] World-state request from peer ", peer_id)
+	if not _players.has(peer_id):
+		var spawn_position := _get_spawn_position(_players.size())
+		var player_color := _assign_player_color(peer_id)
+		_spawn_player_for_peer(peer_id, spawn_position, player_color)
+		_spawn_player_for_peer.rpc_id(peer_id, peer_id, spawn_position, player_color)
+		for connected_peer_id in multiplayer.get_peers():
+			if int(connected_peer_id) != peer_id:
+				_spawn_player_for_peer.rpc_id(int(connected_peer_id), peer_id, spawn_position, player_color)
 	for existing_peer_id in _players.keys():
 		var player := _players[existing_peer_id] as Node3D
 		if player != null:
@@ -199,15 +239,13 @@ func _request_world_state() -> void:
 			if boss.has_method("send_full_state_to_peer"):
 				boss.send_full_state_to_peer(peer_id)
 	_send_active_spell_impacts(peer_id)
-	if not _players.has(peer_id):
-		var spawn_position := _get_spawn_position(_players.size())
-		_spawn_player_for_peer.rpc(peer_id, spawn_position, _assign_player_color(peer_id))
 
 
 @rpc("authority", "call_local", "reliable")
 func _spawn_player_for_peer(peer_id: int, spawn_position: Vector3, player_color: Color = Color(0.18, 0.14, 0.24)) -> void:
 	if _players.has(peer_id):
 		return
+	print("[World] Spawning player ", peer_id, " local_unique=", multiplayer.get_unique_id())
 	var player := PlayerScene.instantiate()
 	player.name = "Player_%d" % peer_id
 	if player.has_method("setup_multiplayer"):
@@ -401,6 +439,43 @@ func _update_basic_caster_difficulty_local(difficulty_data: Dictionary) -> void:
 			caster.set_difficulty_data(difficulty_data)
 
 
+func broadcast_basic_caster_state(
+	bot_id: int,
+	pos: Vector3,
+	yaw: float,
+	health: int,
+	is_dead: bool,
+	blind_timer: float,
+	timestamp: float
+) -> void:
+	if multiplayer.multiplayer_peer == null or not multiplayer.is_server():
+		return
+	_client_receive_basic_caster_state.rpc(bot_id, pos, yaw, health, is_dead, blind_timer, timestamp)
+
+
+@rpc("authority", "unreliable")
+func _client_receive_basic_caster_state(
+	bot_id: int,
+	pos: Vector3,
+	yaw: float,
+	health: int,
+	is_dead: bool,
+	blind_timer: float,
+	timestamp: float
+) -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+		return
+	if multiplayer.is_server():
+		return
+	var caster := _basic_casters.get(bot_id) as Node
+	if caster == null:
+		if _player == null:
+			_request_world_state_from_server()
+		return
+	if caster.has_method("_client_receive_state"):
+		caster._client_receive_state(pos, yaw, health, is_dead, blind_timer, timestamp)
+
+
 func _reconcile_configured_boss() -> void:
 	if not _can_manage_bosses():
 		return
@@ -416,17 +491,19 @@ func spawn_boss(settings: Dictionary = {}) -> bool:
 	if multiplayer.multiplayer_peer != null and not multiplayer.is_server():
 		return false
 	var boss_id := int(settings.get("boss_id", _get_next_boss_id()))
+	var replace_existing := bool(settings.get("replace_existing", false))
 	if _bosses.has(boss_id):
 		var existing := _bosses.get(boss_id) as Node
 		var existing_dead := false
 		if existing != null and existing.has_method("get_state_data"):
 			var state := existing.get_state_data() as Dictionary
 			existing_dead = bool(state.get("is_dead", false))
-		if not existing_dead:
+		if not existing_dead and not replace_existing:
 			return false
 		despawn_boss(boss_id)
 	var spawn_position := settings.get("spawn_position", Vector3(0, 0.0, -14)) as Vector3
 	var boss_settings := settings.duplicate(true)
+	boss_settings.erase("replace_existing")
 	boss_settings["boss_id"] = boss_id
 	boss_settings["spawn_position"] = spawn_position
 	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
@@ -829,6 +906,27 @@ func _client_receive_player_combat_state(
 	var player := _players.get(peer_id) as Node
 	if player != null and player.has_method("apply_network_combat_state"):
 		player.apply_network_combat_state(health, mana, is_dead, respawn_timer, blind_timer, blind_duration, pos, external_velocity)
+
+
+func broadcast_player_transform_state(peer_id: int, pos: Vector3, net_velocity: Vector3, yaw: float, head_pitch: float, timestamp: float) -> void:
+	if multiplayer.multiplayer_peer == null or not multiplayer.is_server():
+		return
+	_client_receive_player_transform_state.rpc(peer_id, pos, net_velocity, yaw, head_pitch, timestamp)
+
+
+@rpc("authority", "unreliable")
+func _client_receive_player_transform_state(peer_id: int, pos: Vector3, net_velocity: Vector3, yaw: float, head_pitch: float, timestamp: float) -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+		return
+	if multiplayer.is_server():
+		return
+	var player := _players.get(peer_id) as Node
+	if player == null:
+		if _player == null:
+			_request_world_state_from_server()
+		return
+	if player.has_method("apply_network_transform_state"):
+		player.apply_network_transform_state(peer_id, pos, net_velocity, yaw, head_pitch, timestamp)
 
 
 func spawn_network_projectile(spell: SpellDefinition, from: Vector3, direction: Vector3, source: Node, cast_server_time: float = -1.0) -> void:
@@ -1356,9 +1454,28 @@ func _prune_expired_spell_impacts() -> void:
 			_active_spell_impacts.remove_at(i)
 
 
+func broadcast_push_test_target_state(pos: Vector3, rot: Vector3, lin_vel: Vector3, ang_vel: Vector3) -> void:
+	if multiplayer.multiplayer_peer == null or not multiplayer.is_server():
+		return
+	_client_receive_push_test_target_state.rpc(pos, rot, lin_vel, ang_vel)
+
+
+@rpc("authority", "unreliable")
+func _client_receive_push_test_target_state(pos: Vector3, rot: Vector3, lin_vel: Vector3, ang_vel: Vector3) -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+		return
+	if multiplayer.is_server():
+		return
+	var target := get_node_or_null("PushTestTarget")
+	if target == null:
+		return
+	if target.has_method("_client_receive_state"):
+		target._client_receive_state(pos, rot, lin_vel, ang_vel)
+
 
 func _spawn_push_test_target() -> void:
 	var target := RigidBody3D.new()
+	target.name = "PushTestTarget"
 	target.set_script(PushTestTargetScript)
 	target.position = Vector3(3.0, 0.8, -9.5)
 	add_child(target)

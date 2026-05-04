@@ -143,9 +143,11 @@ func _apply_bots_command(parts: PackedStringArray) -> Dictionary:
 	var value := parts[1].to_lower()
 	if value in ["on", "true", "yes", "1", "enable", "enabled"]:
 		set_bot_settings(true, maxi(bot_count, 1), bot_difficulty)
+		bot_settings_changed.emit()
 		return {"ok": true, "message": get_bot_settings_summary()}
 	if value in ["off", "false", "no", "0", "disable", "disabled"]:
 		set_bot_settings(false, bot_count, bot_difficulty)
+		bot_settings_changed.emit()
 		return {"ok": true, "message": get_bot_settings_summary()}
 	if value in ["count", "number"]:
 		if parts.size() < 3:
@@ -158,6 +160,7 @@ func _apply_bots_command(parts: PackedStringArray) -> Dictionary:
 	if parts[1].is_valid_int():
 		var count := clampi(int(parts[1]), MIN_BOT_COUNT, MAX_BOT_COUNT)
 		set_bot_settings(count > 0, count, bot_difficulty)
+		bot_settings_changed.emit()
 		return {"ok": true, "message": get_bot_settings_summary()}
 	return {"ok": false, "message": "Usage: bots <on|off|count|difficulty|0-12>"}
 
@@ -167,6 +170,7 @@ func _apply_bot_count(value: String) -> Dictionary:
 		return {"ok": false, "message": "Bot count must be a number from 0 to 12."}
 	var count := clampi(int(value), MIN_BOT_COUNT, MAX_BOT_COUNT)
 	set_bot_settings(count > 0, count, bot_difficulty)
+	bot_settings_changed.emit()
 	return {"ok": true, "message": get_bot_settings_summary()}
 
 
@@ -175,6 +179,7 @@ func _apply_bot_difficulty(value: String) -> Dictionary:
 	if not DIFFICULTIES.has(difficulty):
 		return {"ok": false, "message": "Bot difficulty must be Easy, Medium, or Hard."}
 	set_bot_settings(bots_enabled, bot_count, difficulty)
+	bot_settings_changed.emit()
 	return {"ok": true, "message": get_bot_settings_summary()}
 
 

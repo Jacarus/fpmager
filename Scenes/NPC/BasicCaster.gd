@@ -578,7 +578,17 @@ func _sync_network_state(delta: float) -> void:
 	if _net_sync_timer > 0.0:
 		return
 	_net_sync_timer = 0.1
+	var world := get_tree().current_scene
+	if world != null and world.has_method("broadcast_basic_caster_state"):
+		world.broadcast_basic_caster_state(_get_network_bot_id(), global_position, rotation.y, _health, _is_dead, _blind_timer, _network_time())
+		return
 	_client_receive_state.rpc(global_position, rotation.y, _health, _is_dead, _blind_timer, _network_time())
+
+
+func _get_network_bot_id() -> int:
+	if name.begins_with("BasicCaster_"):
+		return int(name.trim_prefix("BasicCaster_"))
+	return 0
 
 
 @rpc("authority", "unreliable")

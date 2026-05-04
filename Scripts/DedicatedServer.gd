@@ -10,6 +10,7 @@ var _command_poll_timer := 0.0
 var _command_file_path := ""
 var _command_file_offset := 0
 var _command_file_buffer := ""
+var _command_file_read_error_logged := false
 
 
 func _ready() -> void:
@@ -77,10 +78,19 @@ func _init_command_file() -> void:
 	_command_file_path = OS.get_environment("SERVER_COMMAND_FILE")
 	if _command_file_path == "":
 		_command_file_path = "user://server_commands.txt"
+	if not FileAccess.file_exists(_command_file_path):
+		var create_file := FileAccess.open(_command_file_path, FileAccess.WRITE)
+		if create_file == null:
+			push_warning("[Server] Command file cannot be created: %s (%s)" % [_command_file_path, error_string(FileAccess.get_open_error())])
+			return
+		create_file.close()
+		print("[Server] Created command file: %s" % _command_file_path)
 	var file := FileAccess.open(_command_file_path, FileAccess.READ)
 	if file != null:
 		_command_file_offset = file.get_length()
 		file.close()
+	else:
+		push_warning("[Server] Command file cannot be read: %s (%s)" % [_command_file_path, error_string(FileAccess.get_open_error())])
 	print("[Server] Command file: %s" % _command_file_path)
 
 
@@ -89,7 +99,11 @@ func _poll_server_commands() -> void:
 		return
 	var file := FileAccess.open(_command_file_path, FileAccess.READ)
 	if file == null:
+		if not _command_file_read_error_logged:
+			_command_file_read_error_logged = true
+			push_warning("[Server] Command file poll failed: %s (%s)" % [_command_file_path, error_string(FileAccess.get_open_error())])
 		return
+	_command_file_read_error_logged = false
 	var length := file.get_length()
 	if length < _command_file_offset:
 		_command_file_offset = 0
@@ -147,6 +161,16 @@ func _try_run_world_command(command: String) -> Dictionary:
 			var ok := bool(world.spawn_boss(settings))
 			var spawn_message := "boss spawned %s" % str(settings) if ok else "Boss spawn rejected."
 			return {"handled": true, "ok": ok, "message": spawn_message}
+		"replace", "respawn", "restart":
+			if not world.has_method("spawn_boss"):
+				return {"handled": true, "ok": false, "message": "Current scene cannot spawn bosses."}
+			var settings := _parse_boss_settings(parts)
+			settings["replace_existing"] = true
+			if not settings.has("boss_id"):
+				settings["boss_id"] = 0
+			var ok := bool(world.spawn_boss(settings))
+			var replace_message := "boss replaced %s" % str(settings) if ok else "Boss replace rejected."
+			return {"handled": true, "ok": ok, "message": replace_message}
 		"despawn", "remove":
 			if not world.has_method("despawn_boss"):
 				return {"handled": true, "ok": false, "message": "Current scene cannot despawn bosses."}
@@ -195,6 +219,8 @@ func _parse_boss_settings(parts: PackedStringArray) -> Dictionary:
 					settings["movement_speed_scale"] = maxf(0.25, float(value))
 			"respawn", "respawns", "respawn_enabled":
 				settings["respawn_enabled"] = _parse_bool(value)
+			"replace", "replace_existing", "force":
+				settings["replace_existing"] = _parse_bool(value)
 			"respawn_delay":
 				if value.is_valid_float():
 					settings["respawn_delay"] = maxf(0.1, float(value))
@@ -223,7 +249,7 @@ func _get_boss_status_message(world: Node) -> String:
 
 
 func _boss_command_help() -> String:
-	return "Commands: boss spawn [health] [name=Aether_Colossus] [scale=1.0] [cooldown=1.0] [speed=1.0] [respawn=off] [blind=on] [aoe=on] [gravity=on], boss despawn [id], boss status"
+	return "Commands: boss spawn [health] [name=Aether_Colossus] [scale=1.0] [cooldown=1.0] [speed=1.0] [respawn=off] [replace=off] [blind=on] [aoe=on] [gravity=on], boss replace [settings], boss despawn [id], boss status"
 
 
 func _on_peer_connected(id: int) -> void:

@@ -31,6 +31,10 @@ func _physics_process(delta: float) -> void:
 	if _sync_timer > 0.0:
 		return
 	_sync_timer = NETWORK_SYNC_RATE
+	var world := get_tree().current_scene
+	if world != null and world.has_method("broadcast_push_test_target_state"):
+		world.broadcast_push_test_target_state(global_position, global_rotation, linear_velocity, angular_velocity)
+		return
 	_client_receive_state.rpc(global_position, global_rotation, linear_velocity, angular_velocity)
 
 

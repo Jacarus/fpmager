@@ -1900,6 +1900,10 @@ func _sync_network_state(delta: float) -> void:
 	var head_pitch := _head.rotation.x if _head != null else 0.0
 	var timestamp := _network_time()
 	if multiplayer.is_server():
+		var world := get_tree().current_scene
+		if world != null and world.has_method("broadcast_player_transform_state"):
+			world.broadcast_player_transform_state(_network_peer_id, global_position, velocity, rotation.y, head_pitch, timestamp)
+			return
 		_client_receive_player_state.rpc(_network_peer_id, global_position, velocity, rotation.y, head_pitch, timestamp)
 	else:
 		_server_receive_player_state.rpc_id(1, global_position, velocity, rotation.y, head_pitch, timestamp)
@@ -1916,6 +1920,10 @@ func _force_network_transform_sync() -> void:
 	if multiplayer.multiplayer_peer == null or not multiplayer.is_server():
 		return
 	var head_pitch := _head.rotation.x if _head != null else 0.0
+	var world := get_tree().current_scene
+	if world != null and world.has_method("broadcast_player_transform_state"):
+		world.broadcast_player_transform_state(_network_peer_id, global_position, velocity, rotation.y, head_pitch, _network_time())
+		return
 	_client_receive_player_state.rpc(_network_peer_id, global_position, velocity, rotation.y, head_pitch, _network_time())
 
 
@@ -2023,17 +2031,32 @@ func apply_network_combat_state(
 	_apply_combat_state(health, mana, is_dead, respawn_timer, blind_timer, blind_duration, pos, external_velocity)
 
 
+func apply_network_transform_state(peer_id: int, pos: Vector3, net_velocity: Vector3, yaw: float, head_pitch: float, timestamp: float) -> void:
+	if peer_id == multiplayer.get_unique_id():
+		return
+	add_remote_snapshot(pos, net_velocity, yaw, head_pitch, timestamp)
+
+
 @rpc("any_peer", "unreliable")
 func _server_receive_player_state(pos: Vector3, net_velocity: Vector3, yaw: float, head_pitch: float, _timestamp: float) -> void:
 	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
 		return
 	if _server_state_lock_timer > 0.0:
-		_client_receive_player_state.rpc(_network_peer_id, global_position, velocity, rotation.y, _head.rotation.x if _head != null else 0.0, _network_time())
+		var correction_head_pitch := _head.rotation.x if _head != null else 0.0
+		var world := get_tree().current_scene
+		if world != null and world.has_method("broadcast_player_transform_state"):
+			world.broadcast_player_transform_state(_network_peer_id, global_position, velocity, rotation.y, correction_head_pitch, _network_time())
+		else:
+			_client_receive_player_state.rpc(_network_peer_id, global_position, velocity, rotation.y, correction_head_pitch, _network_time())
 		return
 	_update_server_fall_damage_from_motion(pos, net_velocity)
 	velocity = net_velocity
 	add_remote_snapshot(pos, net_velocity, yaw, head_pitch, _network_time())
-	_client_receive_player_state.rpc(_network_peer_id, pos, net_velocity, yaw, head_pitch, _network_time())
+	var world := get_tree().current_scene
+	if world != null and world.has_method("broadcast_player_transform_state"):
+		world.broadcast_player_transform_state(_network_peer_id, pos, net_velocity, yaw, head_pitch, _network_time())
+	else:
+		_client_receive_player_state.rpc(_network_peer_id, pos, net_velocity, yaw, head_pitch, _network_time())
 
 
 func _update_server_fall_damage_from_motion(pos: Vector3, net_velocity: Vector3) -> void:

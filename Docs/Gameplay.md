@@ -33,17 +33,29 @@ health, size, ability cooldown, movement speed, and respawn settings.
 Dedicated servers can change bot settings while running by appending commands to
 the server command file. Supported commands are:
     -status
-    -bots on
+    -bots on  (enables bots and forces reconcile, even if bots are already on)
     -bots off
     -bots <0-12>
     -bot_count <0-12>
     -bot_difficulty <Easy|Medium|Hard>
+Bot commands always trigger a bot reconcile on the server, so sending "bots on"
+when bots are already running will respawn any missing bots.
 On Fly, the command file is /tmp/fp-mager-commands.txt. For example:
     fly ssh console --app fp-mager --command "sh -lc 'echo bots off >> /tmp/fp-mager-commands.txt'"
     fly ssh console --app fp-mager --command "sh -lc 'echo bot_count 4 >> /tmp/fp-mager-commands.txt'"
 From Windows, Scripts\server_command.bat wraps that Fly command:
     Scripts\server_command.bat bots on
     Scripts\server_command.bat bot_difficulty Hard
+    Scripts\server_command.bat boss status
+    Scripts\server_command.bat boss spawn health=2400 name=Aether_Colossus scale=1.2 cooldown=0.85 speed=1.1 respawn=off
+    Scripts\server_command.bat boss replace health=4000 respawn=on
+For local dedicated-server testing, start the server from the repo root:
+    Scripts\start_local_dedicated_server.bat
+Then, in another terminal, append commands to the same local command file:
+    Scripts\local_server_command.bat status
+    Scripts\local_server_command.bat bots on
+    Scripts\local_server_command.bat boss replace health=2400 respawn=on
+The local server prints each accepted command as [ServerCommand] output.
 Join asks for a server address and port, then connects to that hosted game.
 For internet play, the host must allow/forward UDP port 24567, or the selected
 join port, through their firewall/router.
@@ -195,6 +207,8 @@ Online multiplayer uses Godot ENet networking.
         })
       Dedicated servers also accept:
         boss spawn health=2400 name=Aether_Colossus scale=1.2 cooldown=0.85 speed=1.1 respawn=off
+        boss spawn health=2400 replace=on
+        boss replace health=4000 respawn=on
         boss despawn 0
         boss status
       After a defeated non-respawning boss despawns, running boss spawn again creates a
