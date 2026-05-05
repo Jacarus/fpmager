@@ -405,7 +405,9 @@ func _spawn_basic_caster_local(bot_id: int, spawn_position: Vector3, loadout_dat
 		caster.set_spell_loadout_data(loadout_data)
 	if caster.has_method("set_difficulty_data"):
 		caster.set_difficulty_data(difficulty_data)
-	caster.target = _player
+	# Only set target if player is available; otherwise refresh_basic_caster_target will handle it
+	if _player != null:
+		caster.target = _player
 	add_child(caster)
 	_basic_casters[bot_id] = caster
 	print("[World] Bot %d spawned locally, total bots: %d" % [bot_id, _basic_casters.size()])
