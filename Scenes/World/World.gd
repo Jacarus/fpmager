@@ -232,6 +232,7 @@ func _request_world_state(requested_peer_id: int = 0) -> void:
 	for bot_id in _basic_casters.keys():
 		var caster := _basic_casters[bot_id] as Node3D
 		if caster != null:
+			print("[World] Calling _spawn_basic_caster_for_peer for bot %d to peer %d" % [int(bot_id), peer_id])
 			_spawn_basic_caster_for_peer.rpc_id(
 				peer_id,
 				int(bot_id),
@@ -392,6 +393,7 @@ func _spawn_basic_caster_for_all(bot_id: int, spawn_position: Vector3, loadout_d
 
 @rpc("authority", "reliable")
 func _spawn_basic_caster_for_peer(bot_id: int, spawn_position: Vector3, loadout_data: Array, difficulty_data: Dictionary) -> void:
+	print("[World] _spawn_basic_caster_for_peer called: bot_id=%d, position=%s" % [bot_id, str(spawn_position)])
 	_spawn_basic_caster_local(bot_id, spawn_position, loadout_data, difficulty_data)
 
 
