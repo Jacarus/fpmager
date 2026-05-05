@@ -229,7 +229,7 @@ func _request_world_state(requested_peer_id: int = 0) -> void:
 	for bot_id in _basic_casters.keys():
 		var caster := _basic_casters[bot_id] as Node3D
 		if caster != null:
-			_spawn_basic_caster_for_all.rpc_id(
+			_spawn_basic_caster_for_peer.rpc_id(
 				peer_id,
 				int(bot_id),
 				caster.global_position,
@@ -240,7 +240,7 @@ func _request_world_state(requested_peer_id: int = 0) -> void:
 		var boss := _bosses[boss_id] as Node3D
 		if boss != null:
 			var settings: Dictionary = boss.get_settings_data() if boss.has_method("get_settings_data") else {}
-			_spawn_boss_for_all.rpc_id(peer_id, int(boss_id), boss.global_position, settings)
+			_spawn_boss_for_peer.rpc_id(peer_id, int(boss_id), boss.global_position, settings)
 			if boss.has_method("send_full_state_to_peer"):
 				boss.send_full_state_to_peer(peer_id)
 	_send_active_spell_impacts(peer_id)
@@ -384,6 +384,11 @@ func _spawn_basic_caster() -> void:
 
 @rpc("authority", "call_local", "reliable")
 func _spawn_basic_caster_for_all(bot_id: int, spawn_position: Vector3, loadout_data: Array, difficulty_data: Dictionary) -> void:
+	_spawn_basic_caster_local(bot_id, spawn_position, loadout_data, difficulty_data)
+
+
+@rpc("authority", "reliable")
+func _spawn_basic_caster_for_peer(bot_id: int, spawn_position: Vector3, loadout_data: Array, difficulty_data: Dictionary) -> void:
 	_spawn_basic_caster_local(bot_id, spawn_position, loadout_data, difficulty_data)
 
 
@@ -536,6 +541,11 @@ func get_boss_count() -> int:
 
 @rpc("authority", "call_local", "reliable")
 func _spawn_boss_for_all(boss_id: int, spawn_position: Vector3, settings: Dictionary) -> void:
+	_spawn_boss_local(boss_id, spawn_position, settings)
+
+
+@rpc("authority", "reliable")
+func _spawn_boss_for_peer(boss_id: int, spawn_position: Vector3, settings: Dictionary) -> void:
 	_spawn_boss_local(boss_id, spawn_position, settings)
 
 
