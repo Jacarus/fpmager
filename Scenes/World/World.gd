@@ -255,7 +255,11 @@ func _request_world_state(requested_peer_id: int = 0) -> void:
 func _spawn_player_for_peer(peer_id: int, spawn_position: Vector3, player_color: Color = Color(0.18, 0.14, 0.24)) -> void:
 	if _players.has(peer_id):
 		return
-	var local_unique_id := multiplayer.get_unique_id() if (multiplayer.multiplayer_peer != null and multiplayer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED) else 0
+	var local_unique_id := 0
+	if multiplayer.multiplayer_peer != null:
+		var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+		if peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED:
+			local_unique_id = multiplayer.get_unique_id()
 	print("[World] Spawning player ", peer_id, " local_unique=", local_unique_id)
 	var player := PlayerScene.instantiate()
 	player.name = "Player_%d" % peer_id
@@ -267,7 +271,7 @@ func _spawn_player_for_peer(peer_id: int, spawn_position: Vector3, player_color:
 	_players_root.add_child(player)
 	_players[peer_id] = player
 	# Only set _player if multiplayer is active
-	if _player == null or (multiplayer.multiplayer_peer != null and multiplayer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED and peer_id == local_unique_id):
+	if _player == null or (local_unique_id != 0 and peer_id == local_unique_id):
 		_player = player
 	_refresh_basic_caster_target()
 	_refresh_boss_targets()
