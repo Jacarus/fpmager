@@ -382,7 +382,7 @@ func _spawn_basic_caster() -> void:
 	_spawn_basic_caster_local(0, Vector3(0, 0.0, -12), _create_random_bot_loadout(), _get_bot_difficulty_data())
 
 
-@rpc("authority", "reliable")
+@rpc("authority", "call_local", "reliable")
 func _spawn_basic_caster_for_all(bot_id: int, spawn_position: Vector3, loadout_data: Array, difficulty_data: Dictionary) -> void:
 	_spawn_basic_caster_local(bot_id, spawn_position, loadout_data, difficulty_data)
 
@@ -534,7 +534,7 @@ func get_boss_count() -> int:
 	return _bosses.size()
 
 
-@rpc("authority", "reliable")
+@rpc("authority", "call_local", "reliable")
 func _spawn_boss_for_all(boss_id: int, spawn_position: Vector3, settings: Dictionary) -> void:
 	_spawn_boss_local(boss_id, spawn_position, settings)
 
