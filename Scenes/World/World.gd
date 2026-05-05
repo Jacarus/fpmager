@@ -108,6 +108,9 @@ func _request_world_state_from_server() -> void:
 		return
 	if _world_state_request_cooldown > 0.0:
 		return
+	var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+	if peer == null or peer.get_connection_status() != MultiplayerPeer.CONNECTION_CONNECTED:
+		return
 	_world_state_request_cooldown = 1.0
 	_world_state_retry_timer = 1.0
 	_request_world_state.rpc_id(1, multiplayer.get_unique_id())
