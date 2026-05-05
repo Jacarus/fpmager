@@ -11,6 +11,7 @@ var _command_file_path := ""
 var _command_file_offset := 0
 var _command_file_buffer := ""
 var _command_file_read_error_logged := false
+var _world_ready := false
 
 
 func _ready() -> void:
@@ -95,6 +96,8 @@ func _init_command_file() -> void:
 
 
 func _poll_server_commands() -> void:
+	if not _world_ready:
+		return
 	if _command_file_path == "":
 		return
 	var file := FileAccess.open(_command_file_path, FileAccess.READ)
@@ -135,6 +138,8 @@ func _run_server_command(raw_command: String) -> void:
 	var result := _try_run_world_command(command)
 	if not bool(result.get("handled", false)):
 		result = GameSettings.apply_server_command(command)
+		if bool(result.get("ok", false)) and _is_bot_settings_command(command):
+			_force_world_bot_reconcile()
 	var message := str(result.get("message", ""))
 	if bool(result.get("ok", false)):
 		if message != "":
@@ -143,9 +148,44 @@ func _run_server_command(raw_command: String) -> void:
 		print("[ServerCommand] ERROR: %s" % message)
 
 
+func _is_bot_settings_command(command: String) -> bool:
+	var parts := command.split(" ", false)
+	if parts.is_empty():
+		return false
+	return parts[0].to_lower() in ["bots", "bot_count", "botcount", "bot_difficulty", "botdifficulty", "difficulty"]
+
+
+func _force_world_bot_reconcile() -> void:
+	var world := get_tree().current_scene
+	if world == null:
+		push_warning("[Server] Cannot reconcile bots: world not loaded.")
+		return
+	if not world.has_method("force_reconcile_bots"):
+		push_warning("[Server] Current scene does not support force_reconcile_bots().")
+		return
+	world.force_reconcile_bots()
+
+
 func _try_run_world_command(command: String) -> Dictionary:
 	var parts := command.split(" ", false)
-	if parts.is_empty() or parts[0].to_lower() != "boss":
+	if parts.is_empty():
+		return {"handled": false}
+	var first := parts[0].to_lower()
+	if first == "bot" and parts.size() >= 2:
+		var bot_action := parts[1].to_lower()
+		var bot_world := get_tree().current_scene
+		if bot_world == null:
+			return {"handled": true, "ok": false, "message": "World not loaded."}
+		match bot_action:
+			"status":
+				var bot_count: int = bot_world.get("_basic_casters").size() if bot_world.get("_basic_casters") != null else -1
+				return {"handled": true, "ok": true, "message": "world bot count: %d  settings: %s" % [bot_count, GameSettings.get_bot_settings_summary()]}
+			"reconcile":
+				_force_world_bot_reconcile()
+				return {"handled": true, "ok": true, "message": "bot reconcile requested. settings: %s" % GameSettings.get_bot_settings_summary()}
+			_:
+				return {"handled": true, "ok": false, "message": "Unknown bot action '%s'. Try: bot status, bot reconcile" % bot_action}
+	if first != "boss":
 		return {"handled": false}
 	var world := get_tree().current_scene
 	if world == null:
@@ -258,3 +298,9 @@ func _on_peer_connected(id: int) -> void:
 
 func _on_peer_disconnected(id: int) -> void:
 	print("[Server] Peer %d disconnected" % id)
+
+
+func notify_world_ready() -> void:
+	_world_ready = true
+	print("[Server] World ready, processing any pending commands...")
+	_poll_server_commands()

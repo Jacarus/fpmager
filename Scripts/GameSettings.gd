@@ -113,8 +113,8 @@ func apply_server_command(command: String) -> Dictionary:
 	if parts.is_empty():
 		return {"ok": true, "message": ""}
 
-	var name := parts[0].to_lower()
-	match name:
+	var cmd := parts[0].to_lower()
+	match cmd:
 		"help":
 			return {"ok": true, "message": _server_command_help()}
 		"status", "bot_status":

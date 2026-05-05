@@ -71,6 +71,8 @@ func _ready() -> void:
 		_spawn_configured_bots()
 		_spawn_configured_boss()
 	_spawn_push_test_target()
+	if _is_dedicated_server():
+		DedicatedServer.notify_world_ready()
 
 
 func _process(_delta: float) -> void:
@@ -115,6 +117,8 @@ func _retry_world_state_request(delta: float) -> void:
 	if multiplayer.multiplayer_peer == null or multiplayer.is_server():
 		return
 	if _player != null:
+		return
+	if _creator_layer != null:
 		return
 	_world_state_retry_timer -= delta
 	if _world_state_retry_timer > 0.0:
@@ -209,7 +213,7 @@ func _request_world_state(requested_peer_id: int = 0) -> void:
 		print("[World] Ignoring world-state request with invalid peer id: ", peer_id)
 		return
 	print("[World] World-state request from peer ", peer_id)
-	if not _players.has(peer_id):
+	if not _players.has(peer_id) and not _peers_in_creator.has(peer_id):
 		var spawn_position := _get_spawn_position(_players.size())
 		var player_color := _assign_player_color(peer_id)
 		_spawn_player_for_peer(peer_id, spawn_position, player_color)
@@ -221,6 +225,7 @@ func _request_world_state(requested_peer_id: int = 0) -> void:
 		var player := _players[existing_peer_id] as Node3D
 		if player != null:
 			_spawn_player_for_peer.rpc_id(peer_id, int(existing_peer_id), player.global_position, _get_player_color(int(existing_peer_id)))
+	print("[World] Sending %d bots to peer %d" % [_basic_casters.size(), peer_id])
 	for bot_id in _basic_casters.keys():
 		var caster := _basic_casters[bot_id] as Node3D
 		if caster != null:
@@ -241,42 +246,45 @@ func _request_world_state(requested_peer_id: int = 0) -> void:
 	_send_active_spell_impacts(peer_id)
 
 
-@rpc("authority", "call_local", "reliable")
+@rpc("any_peer", "call_local", "reliable")
 func _spawn_player_for_peer(peer_id: int, spawn_position: Vector3, player_color: Color = Color(0.18, 0.14, 0.24)) -> void:
-	if _players.has(peer_id):
-		return
-	print("[World] Spawning player ", peer_id, " local_unique=", multiplayer.get_unique_id())
-	var player := PlayerScene.instantiate()
-	player.name = "Player_%d" % peer_id
-	if player.has_method("setup_multiplayer"):
-		player.setup_multiplayer(peer_id, peer_id == multiplayer.get_unique_id())
-	if player.has_method("set_player_color"):
-		player.set_player_color(player_color)
-	player.position = spawn_position
-	_players_root.add_child(player)
-	_players[peer_id] = player
-	if _player == null or peer_id == multiplayer.get_unique_id():
-		_player = player
-	_refresh_basic_caster_target()
-	_refresh_boss_targets()
+	if multiplayer.is_server():
+		if _players.has(peer_id):
+			return
+		print("[World] Spawning player ", peer_id, " local_unique=", multiplayer.get_unique_id())
+		var player := PlayerScene.instantiate()
+		player.name = "Player_%d" % peer_id
+		if player.has_method("setup_multiplayer"):
+			player.setup_multiplayer(peer_id, peer_id == multiplayer.get_unique_id())
+		if player.has_method("set_player_color"):
+			player.set_player_color(player_color)
+		player.position = spawn_position
+		_players_root.add_child(player)
+		_players[peer_id] = player
+		if _player == null or peer_id == multiplayer.get_unique_id():
+			_player = player
+		_refresh_basic_caster_target()
+		_refresh_boss_targets()
 
 
 func _on_peer_disconnected(peer_id: int) -> void:
 	_player_color_indices.erase(peer_id)
+	_peers_in_creator.erase(peer_id)
 	_despawn_player_for_peer.rpc(peer_id)
 
 
-@rpc("authority", "call_local", "reliable")
+@rpc("any_peer", "call_local", "reliable")
 func _despawn_player_for_peer(peer_id: int) -> void:
-	var player := _players.get(peer_id) as Node
-	if player != null:
-		player.queue_free()
-	unregister_beam_segment("player:%d" % peer_id)
-	_players.erase(peer_id)
-	if _player == player:
-		_player = null
-	_refresh_basic_caster_target()
-	_refresh_boss_targets()
+	if multiplayer.is_server():
+		var player := _players.get(peer_id) as Node
+		if player != null:
+			player.queue_free()
+			unregister_beam_segment("player:%d" % peer_id)
+			_players.erase(peer_id)
+			if _player == player:
+				_player = null
+			_refresh_basic_caster_target()
+			_refresh_boss_targets()
 
 
 func _assign_player_color(peer_id: int) -> Color:
@@ -319,6 +327,10 @@ func _on_bot_settings_changed() -> void:
 	_reconcile_configured_bots()
 
 
+func force_reconcile_bots() -> void:
+	_reconcile_configured_bots()
+
+
 func _spawn_configured_boss() -> void:
 	_reconcile_configured_boss()
 
@@ -339,6 +351,7 @@ func _reconcile_configured_bots() -> void:
 	if not _can_manage_bots():
 		return
 	var desired_count := GameSettings.bot_count if GameSettings.bots_enabled else 0
+	print("[World] _reconcile_configured_bots: desired=%d current=%d bots_enabled=%s" % [desired_count, _basic_casters.size(), str(GameSettings.bots_enabled)])
 	for bot_id in _basic_casters.keys():
 		if int(bot_id) >= desired_count:
 			_despawn_basic_caster(bot_id)
@@ -348,6 +361,7 @@ func _reconcile_configured_bots() -> void:
 		var pos := _get_bot_spawn_position(i)
 		var loadout := _create_random_bot_loadout()
 		var difficulty_data := _get_bot_difficulty_data()
+		print("[World] Spawning bot %d at %s" % [i, str(pos)])
 		if multiplayer.multiplayer_peer != null and multiplayer.is_server():
 			_spawn_basic_caster_for_all.rpc(i, pos, loadout, difficulty_data)
 		else:
@@ -372,9 +386,8 @@ func _spawn_basic_caster() -> void:
 
 @rpc("any_peer", "call_local", "reliable")
 func _spawn_basic_caster_for_all(bot_id: int, spawn_position: Vector3, loadout_data: Array, difficulty_data: Dictionary) -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
-		return
-	_spawn_basic_caster_local(bot_id, spawn_position, loadout_data, difficulty_data)
+	if multiplayer.is_server():
+		_spawn_basic_caster_local(bot_id, spawn_position, loadout_data, difficulty_data)
 
 
 func _spawn_basic_caster_local(bot_id: int, spawn_position: Vector3, loadout_data: Array, difficulty_data: Dictionary) -> void:
@@ -390,6 +403,7 @@ func _spawn_basic_caster_local(bot_id: int, spawn_position: Vector3, loadout_dat
 	caster.target = _player
 	add_child(caster)
 	_basic_casters[bot_id] = caster
+	print("[World] Bot %d spawned locally, total bots: %d" % [bot_id, _basic_casters.size()])
 	if _basic_caster == null:
 		_basic_caster = caster
 	_refresh_basic_caster_target()
@@ -397,9 +411,8 @@ func _spawn_basic_caster_local(bot_id: int, spawn_position: Vector3, loadout_dat
 
 @rpc("any_peer", "call_local", "reliable")
 func _despawn_basic_caster_for_all(bot_id: int) -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
-		return
-	_despawn_basic_caster_local(bot_id)
+	if multiplayer.is_server():
+		_despawn_basic_caster_local(bot_id)
 
 
 func _despawn_basic_caster_local(bot_id: int) -> void:
@@ -426,10 +439,8 @@ func _update_existing_bot_difficulty() -> void:
 		_update_basic_caster_difficulty_local(difficulty_data)
 
 
-@rpc("any_peer", "call_local", "reliable")
+@rpc("authority", "call_local", "reliable")
 func _update_basic_caster_difficulty_for_all(difficulty_data: Dictionary) -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
-		return
 	_update_basic_caster_difficulty_local(difficulty_data)
 
 
@@ -463,8 +474,6 @@ func _client_receive_basic_caster_state(
 	blind_timer: float,
 	timestamp: float
 ) -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
-		return
 	if multiplayer.is_server():
 		return
 	var caster := _basic_casters.get(bot_id) as Node
@@ -531,9 +540,8 @@ func get_boss_count() -> int:
 
 @rpc("any_peer", "call_local", "reliable")
 func _spawn_boss_for_all(boss_id: int, spawn_position: Vector3, settings: Dictionary) -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
-		return
-	_spawn_boss_local(boss_id, spawn_position, settings)
+	if multiplayer.is_server():
+		_spawn_boss_local(boss_id, spawn_position, settings)
 
 
 func _spawn_boss_local(boss_id: int, spawn_position: Vector3, settings: Dictionary) -> void:
@@ -558,9 +566,8 @@ func _spawn_boss_local(boss_id: int, spawn_position: Vector3, settings: Dictiona
 
 @rpc("any_peer", "call_local", "reliable")
 func _despawn_boss_for_all(boss_id: int) -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
-		return
-	_despawn_boss_local(boss_id)
+	if multiplayer.is_server():
+		_despawn_boss_local(boss_id)
 
 
 func _despawn_boss_local(boss_id: int) -> void:
@@ -701,7 +708,6 @@ func open_spell_creator_for_local_player() -> void:
 			_server_set_peer_in_creator.rpc_id(1, true)
 			_show_spell_creator_overlay()
 	else:
-		_despawn_player_for_peer(peer_id)
 		_show_spell_creator_overlay()
 
 
@@ -713,8 +719,6 @@ func close_spell_creator_for_local_player() -> void:
 			_set_peer_in_creator(peer_id, false)
 		else:
 			_server_set_peer_in_creator.rpc_id(1, false)
-	else:
-		_spawn_player_for_peer(peer_id, _get_spawn_position(_players.size()), _assign_player_color(peer_id))
 
 
 @rpc("any_peer", "reliable")
@@ -729,14 +733,18 @@ func _set_peer_in_creator(peer_id: int, in_creator: bool) -> void:
 		if _peers_in_creator.has(peer_id):
 			return
 		_peers_in_creator[peer_id] = true
-		_despawn_player_for_peer.rpc(peer_id)
+		# Don't despawn the player - keep the node alive for RPC calls
+		# Just mark them as in creator so they don't participate in gameplay
 		if peer_id == multiplayer.get_unique_id():
 			_show_spell_creator_overlay()
 	else:
 		if not _peers_in_creator.has(peer_id):
 			return
 		_peers_in_creator.erase(peer_id)
-		_spawn_player_for_peer.rpc(peer_id, _get_spawn_position(_players.size()), _get_player_color(peer_id))
+		# Player already exists, no need to respawn
+		# Just close the overlay if we're the local player
+		if peer_id == multiplayer.get_unique_id():
+			_close_spell_creator_overlay()
 
 
 func _show_spell_creator_overlay() -> void:
@@ -889,7 +897,7 @@ func broadcast_player_combat_state(
 	)
 
 
-@rpc("any_peer", "call_local", "reliable")
+@rpc("authority", "call_local", "reliable")
 func _client_receive_player_combat_state(
 	peer_id: int,
 	health: int,
@@ -901,8 +909,6 @@ func _client_receive_player_combat_state(
 	pos: Vector3,
 	external_velocity: Vector3
 ) -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
-		return
 	var player := _players.get(peer_id) as Node
 	if player != null and player.has_method("apply_network_combat_state"):
 		player.apply_network_combat_state(health, mana, is_dead, respawn_timer, blind_timer, blind_duration, pos, external_velocity)
@@ -916,8 +922,6 @@ func broadcast_player_transform_state(peer_id: int, pos: Vector3, net_velocity: 
 
 @rpc("authority", "unreliable")
 func _client_receive_player_transform_state(peer_id: int, pos: Vector3, net_velocity: Vector3, yaw: float, head_pitch: float, timestamp: float) -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
-		return
 	if multiplayer.is_server():
 		return
 	var player := _players.get(peer_id) as Node
@@ -955,10 +959,8 @@ func remember_predicted_projectile(spell: SpellDefinition, from: Vector3, direct
 	_prune_predicted_projectile_echoes()
 
 
-@rpc("any_peer", "reliable")
+@rpc("authority", "reliable")
 func _client_spawn_network_projectile(spell_data: Dictionary, from: Vector3, direction: Vector3, source_peer_id: int) -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
-		return
 	if multiplayer.is_server():
 		return
 	var spell := SpellNetworkCodecScript.from_dict(spell_data)
@@ -1399,10 +1401,8 @@ func broadcast_spell_impact(spell: SpellDefinition, position: Vector3, normal: V
 	_client_spawn_spell_impact.rpc(impact_id, spell_data, position, normal, 0.0)
 
 
-@rpc("any_peer", "reliable")
+@rpc("authority", "reliable")
 func _client_spawn_spell_impact(impact_id: int, spell_data: Dictionary, position: Vector3, normal: Vector3, age: float = 0.0) -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
-		return
 	if multiplayer.is_server():
 		return
 	var effect := SpellImpactEffectScript.new()
@@ -1462,8 +1462,6 @@ func broadcast_push_test_target_state(pos: Vector3, rot: Vector3, lin_vel: Vecto
 
 @rpc("authority", "unreliable")
 func _client_receive_push_test_target_state(pos: Vector3, rot: Vector3, lin_vel: Vector3, ang_vel: Vector3) -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
-		return
 	if multiplayer.is_server():
 		return
 	var target := get_node_or_null("PushTestTarget")

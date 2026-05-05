@@ -38,8 +38,13 @@ the server command file. Supported commands are:
     -bots <0-12>
     -bot_count <0-12>
     -bot_difficulty <Easy|Medium|Hard>
+    -bot status     (prints world bot count and current settings)
+    -bot reconcile  (forces the world to reconcile bots from current settings)
 Bot commands always trigger a bot reconcile on the server, so sending "bots on"
-when bots are already running will respawn any missing bots.
+when bots are already running will respawn any missing bots. The dedicated
+server invokes the world's reconcile directly after each accepted bot command,
+in addition to the bot_settings_changed signal, so reconcile still happens even
+if a peer is in an unusual state.
 On Fly, the command file is /tmp/fp-mager-commands.txt. For example:
     fly ssh console --app fp-mager --command "sh -lc 'echo bots off >> /tmp/fp-mager-commands.txt'"
     fly ssh console --app fp-mager --command "sh -lc 'echo bot_count 4 >> /tmp/fp-mager-commands.txt'"
@@ -129,6 +134,10 @@ Online multiplayer uses Godot ENet networking.
     -When a player opens the spell creator from the in-game menu, the server despawns
      their player body for all peers. Closing the creator requests a fresh spawn so
      loadout changes are picked up by the new player instance.
+    -While a peer is in the spell creator, the server tracks them in an "in creator"
+     set and will not respawn them on a stray world-state request. The client also
+     suppresses its own world-state retry while its creator overlay is open, so the
+     creator UI is never interrupted by an unwanted player respawn.
     -Saved spell resources are loaded with cache bypassing when returning to gameplay,
      so edited spells and loadout assignments use the latest saved data.
     -After respawn, the server briefly ignores stale client movement packets and
