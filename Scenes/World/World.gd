@@ -104,16 +104,17 @@ func _is_dedicated_server() -> bool:
 
 
 func _request_world_state_from_server() -> void:
-	if multiplayer.multiplayer_peer == null or multiplayer.is_server():
-		return
-	if _world_state_request_cooldown > 0.0:
+	if multiplayer.multiplayer_peer == null:
 		return
 	var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
 	if peer == null or peer.get_connection_status() != MultiplayerPeer.CONNECTION_CONNECTED:
 		return
+	var local_unique_id := multiplayer.get_unique_id()
+	if local_unique_id == 0:
+		return
 	_world_state_request_cooldown = 1.0
 	_world_state_retry_timer = 1.0
-	_request_world_state.rpc_id(1, multiplayer.get_unique_id())
+	_request_world_state.rpc_id(1, local_unique_id)
 
 
 func _retry_world_state_request(delta: float) -> void:
@@ -254,17 +255,19 @@ func _request_world_state(requested_peer_id: int = 0) -> void:
 func _spawn_player_for_peer(peer_id: int, spawn_position: Vector3, player_color: Color = Color(0.18, 0.14, 0.24)) -> void:
 	if _players.has(peer_id):
 		return
-	print("[World] Spawning player ", peer_id, " local_unique=", multiplayer.get_unique_id())
+	var local_unique_id := multiplayer.get_unique_id() if (multiplayer.multiplayer_peer != null and multiplayer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED) else 0
+	print("[World] Spawning player ", peer_id, " local_unique=", local_unique_id)
 	var player := PlayerScene.instantiate()
 	player.name = "Player_%d" % peer_id
 	if player.has_method("setup_multiplayer"):
-		player.setup_multiplayer(peer_id, peer_id == multiplayer.get_unique_id())
+		player.setup_multiplayer(peer_id, peer_id == local_unique_id)
 	if player.has_method("set_player_color"):
 		player.set_player_color(player_color)
 	player.position = spawn_position
 	_players_root.add_child(player)
 	_players[peer_id] = player
-	if _player == null or peer_id == multiplayer.get_unique_id():
+	# Only set _player if multiplayer is active
+	if _player == null or (multiplayer.multiplayer_peer != null and multiplayer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED and peer_id == local_unique_id):
 		_player = player
 	_refresh_basic_caster_target()
 	_refresh_boss_targets()
