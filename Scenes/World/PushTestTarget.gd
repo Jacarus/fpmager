@@ -122,7 +122,9 @@ func _client_receive_state(pos: Vector3, rot: Vector3, lin_vel: Vector3, ang_vel
 
 
 func _is_network_client() -> bool:
-	if multiplayer.multiplayer_peer == null:
+	if not multiplayer.has_multiplayer_peer():
 		return false
 	var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
-	return peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED and not multiplayer.is_server()
+	if peer == null or peer.get_connection_status() != MultiplayerPeer.CONNECTION_CONNECTED:
+		return false
+	return not multiplayer.is_server()
