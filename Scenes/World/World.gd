@@ -425,8 +425,10 @@ func _spawn_basic_caster() -> void:
 	_spawn_basic_caster_local(0, Vector3(0, 0.0, -12), _create_random_bot_loadout(), _get_bot_difficulty_data())
 
 
-@rpc("authority", "call_local", "reliable")
+@rpc("any_peer", "call_local", "reliable")
 func _spawn_basic_caster_for_all(bot_id: int, spawn_position: Vector3, loadout_data: Array, difficulty_data: Dictionary) -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+		return
 	_spawn_basic_caster_local(bot_id, spawn_position, loadout_data, difficulty_data)
 
 
@@ -459,8 +461,10 @@ func _spawn_basic_caster_local(bot_id: int, spawn_position: Vector3, loadout_dat
 	_refresh_basic_caster_target()
 
 
-@rpc("authority", "call_local", "reliable")
+@rpc("any_peer", "call_local", "reliable")
 func _despawn_basic_caster_for_all(bot_id: int) -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+		return
 	_despawn_basic_caster_local(bot_id)
 
 
@@ -587,8 +591,10 @@ func get_boss_count() -> int:
 	return _bosses.size()
 
 
-@rpc("authority", "call_local", "reliable")
+@rpc("any_peer", "call_local", "reliable")
 func _spawn_boss_for_all(boss_id: int, spawn_position: Vector3, settings: Dictionary) -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+		return
 	_spawn_boss_local(boss_id, spawn_position, settings)
 
 
@@ -619,8 +625,10 @@ func _spawn_boss_local(boss_id: int, spawn_position: Vector3, settings: Dictiona
 		update_boss_health_hud(boss.get_state_data())
 
 
-@rpc("authority", "call_local", "reliable")
+@rpc("any_peer", "call_local", "reliable")
 func _despawn_boss_for_all(boss_id: int) -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+		return
 	_despawn_boss_local(boss_id)
 
 
