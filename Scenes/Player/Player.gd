@@ -9,6 +9,10 @@ const MAX_MANA := 100.0
 const MAX_HEALTH := 100
 const RESPAWN_DELAY := 2.5
 const MANA_REGEN_PER_SECOND := 14.0
+const FALL_DAMAGE_SAFE_HEIGHT := 5.0
+const FALL_DAMAGE_PER_METER := 18.0
+const HARD_LANDING_MOMENTUM_CANCEL_HEIGHT := 3.0
+const FALL_LANDING_VELOCITY_EPSILON := 0.2
 const BEAM_MANA_TICK_MINIMUM := 0.35
 const SPHERE_MAX_CHARGE_TIME := 2.5
 const SPHERE_MAX_CHARGE_SIZE_BONUS := 5
@@ -21,6 +25,8 @@ const TEST_SPELL_PATH := "user://test_spell.tres"
 const CAMERA_OFFSET := Vector3(0.75, 0.25, 3.2)
 const CAMERA_LOOK_AHEAD := Vector3(0.0, 0.0, -8.0)
 const PUSH_RECOIL_SCALE := 0.55
+const PUSH_RECOIL_BASE_RADIUS := 2.4
+const PUSH_RECOIL_SIZE_RADIUS_SCALE := 0.35
 const PLAYER_WATER_TEST_PUSH := 8.0
 const DIRECT_GRAVITY_RADIUS := 3.0
 const NETWORK_SEND_RATE := 0.016
@@ -29,6 +35,10 @@ const REMOTE_SNAPSHOT_LIMIT := 24
 const REMOTE_EXTRAPOLATION_LIMIT := 0.2
 const REMOTE_SNAP_DISTANCE := 4.0
 const KILL_ZONE_Y := -12.0
+const BURN_DURATION := 2.4
+const BURN_TICK_INTERVAL := 0.75
+const BURN_DAMAGE_SCALE := 0.35
+const DEATH_ANIMATION_DURATION := 0.85
 const ELEMENT_COLORS: Dictionary = {
 	"Fire": Color(1.0, 0.35, 0.05),
 	"Water": Color(0.1, 0.55, 1.0),
@@ -55,6 +65,7 @@ var _mana_label: Label
 var _hint_label: Label
 var _blind_overlay: ColorRect
 var _pause_overlay: CanvasLayer
+var _fullscreen_btn: Button
 var _spells: Array[SpellDefinition] = []
 var _active_index: int = 0
 var _loadout_slots: Array[SpellDefinition] = []
@@ -67,10 +78,21 @@ var _mana: float = MAX_MANA
 var _external_velocity: Vector3 = Vector3.ZERO
 var _blind_timer: float = 0.0
 var _blind_duration: float = 0.0
+var _burn_timer: float = 0.0
+var _burn_tick_timer: float = 0.0
+var _burn_tick_damage: int = 0
 var _is_dead: bool = false
 var _respawn_timer: float = 0.0
 var _kill_zone_respawn_timer: float = -1.0
 var _respawn_position: Vector3
+var _was_on_floor_last_frame: bool = true
+var _fall_peak_y: float = 0.0
+var _server_was_falling: bool = false
+var _server_fall_peak_y: float = 0.0
+var _server_previous_pos: Vector3
+var _server_previous_velocity: Vector3 = Vector3.ZERO
+var _server_has_previous_motion: bool = false
+var _jump_was_pressed_last_frame: bool = false
 var _active_beam: Node3D
 var _active_beam_spell: SpellDefinition
 var _beam_visible_length: float = 0.0
@@ -78,6 +100,27 @@ var _beam_impact_timer: float = 0.0
 var _beam_core: MeshInstance3D
 var _beam_tip: MeshInstance3D
 var _beam_light: OmniLight3D
+var _server_beam_origin: Vector3
+var _server_beam_target: Vector3
+var _server_beam_correction_time: float = -1.0
+var _remote_beam: Node3D
+var _remote_beam_spell: SpellDefinition
+var _remote_beam_core: MeshInstance3D
+var _remote_beam_tip: MeshInstance3D
+var _remote_beam_light: OmniLight3D
+var _remote_beam_origin: Vector3
+var _remote_beam_target: Vector3
+var _remote_beam_last_update_time: float = 0.0
+var _player_color: Color = Color(0.18, 0.14, 0.24)
+var _visual_root: Node3D
+var _body_mesh: MeshInstance3D
+var _hand_mesh: MeshInstance3D
+var _body_material: StandardMaterial3D
+var _hand_material: StandardMaterial3D
+var _death_burst: MeshInstance3D
+var _death_burst_material: StandardMaterial3D
+var _death_anim_time: float = 0.0
+var _death_anim_active: bool = false
 var _charging_sphere_spell: SpellDefinition
 var _charging_sphere_time: float = 0.0
 var _charging_sphere_paid_size: int = 0
@@ -104,8 +147,22 @@ func setup_multiplayer(peer_id: int, is_local_player: bool) -> void:
 	_remote_snapshots.clear()
 
 
+func set_player_color(color: Color) -> void:
+	_player_color = color
+	if _body_material != null:
+		_body_material.albedo_color = _player_color
+		_body_material.emission = _player_color
+	if _death_burst_material != null:
+		_death_burst_material.albedo_color = Color(_player_color.r, _player_color.g, _player_color.b, _death_burst_material.albedo_color.a)
+		_death_burst_material.emission = _player_color
+
+
 func get_network_peer_id() -> int:
 	return _network_peer_id
+
+
+func is_combat_targetable() -> bool:
+	return not _is_dead and not is_queued_for_deletion()
 
 
 func _ready() -> void:
@@ -118,9 +175,18 @@ func _ready() -> void:
 	_respawn_position = global_position
 	if _is_local_player:
 		Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+	_was_on_floor_last_frame = is_on_floor()
+	_fall_peak_y = global_position.y
+	_server_previous_pos = global_position
+	_server_fall_peak_y = global_position.y
 
 
 func _notification(what: int) -> void:
+	if what == NOTIFICATION_PREDELETE:
+		_stop_remote_beam_visual()
+		if _active_beam != null:
+			_active_beam.queue_free()
+		return
 	if not _is_local_player:
 		return
 	if what == NOTIFICATION_APPLICATION_FOCUS_OUT:
@@ -133,8 +199,19 @@ func _notification(what: int) -> void:
 
 
 func _process(delta: float) -> void:
+	_tick_remote_beam_visual()
 	if not _is_local_player:
 		_update_remote_visual_transform(delta)
+	_update_death_animation(delta)
+
+
+func _tick_remote_beam_visual() -> void:
+	if _remote_beam == null:
+		return
+	if _network_time() - _remote_beam_last_update_time > 0.6:
+		_stop_remote_beam_visual()
+		return
+	_apply_remote_beam_transform()
 
 
 func _build_body() -> void:
@@ -164,22 +241,33 @@ func _build_body() -> void:
 
 
 func _build_visible_mage() -> void:
-	var body_mat := StandardMaterial3D.new()
-	body_mat.albedo_color = Color(0.18, 0.14, 0.24)
-	body_mat.roughness = 0.8
+	_visual_root = Node3D.new()
+	_visual_root.name = "MageVisual"
+	add_child(_visual_root)
+
+	_body_material = StandardMaterial3D.new()
+	_body_material.albedo_color = _player_color
+	_body_material.emission_enabled = true
+	_body_material.emission = _player_color
+	_body_material.emission_energy_multiplier = 0.12
+	_body_material.roughness = 0.8
+	_body_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 
 	var body := MeshInstance3D.new()
 	var body_mesh := CapsuleMesh.new()
 	body_mesh.radius = 0.32
 	body_mesh.height = 1.45
 	body.mesh = body_mesh
-	body.material_override = body_mat
+	body.material_override = _body_material
 	body.position.y = 0.8
-	add_child(body)
+	_visual_root.add_child(body)
+	_body_mesh = body
 
 	var hand_mat := StandardMaterial3D.new()
 	hand_mat.albedo_color = Color(0.55, 0.46, 0.38)
 	hand_mat.roughness = 0.65
+	hand_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	_hand_material = hand_mat
 
 	var hand := MeshInstance3D.new()
 	var hand_mesh := SphereMesh.new()
@@ -189,6 +277,26 @@ func _build_visible_mage() -> void:
 	hand.material_override = hand_mat
 	hand.position = _cast_origin.position
 	_head.add_child(hand)
+	_hand_mesh = hand
+
+	_death_burst_material = StandardMaterial3D.new()
+	_death_burst_material.albedo_color = Color(_player_color.r, _player_color.g, _player_color.b, 0.0)
+	_death_burst_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	_death_burst_material.emission_enabled = true
+	_death_burst_material.emission = _player_color
+	_death_burst_material.emission_energy_multiplier = 0.0
+	_death_burst_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+
+	_death_burst = MeshInstance3D.new()
+	_death_burst.name = "DeathBurst"
+	var burst_mesh := SphereMesh.new()
+	burst_mesh.radius = 0.45
+	burst_mesh.height = 0.9
+	_death_burst.mesh = burst_mesh
+	_death_burst.material_override = _death_burst_material
+	_death_burst.position.y = 0.9
+	_death_burst.visible = false
+	add_child(_death_burst)
 
 
 func _build_hud() -> void:
@@ -287,7 +395,7 @@ func _build_hud() -> void:
 	_hint_label.offset_top = 12.0
 	_hint_label.offset_right = -16.0
 	_hint_label.offset_bottom = 32.0
-	_hint_label.text = "WASD: Move   Space: Jump   LMB/RMB/Shift: Cast slots   Scroll: Browse spells   1/2/3: Assign browsed spell   ESC: Menu"
+	_hint_label.text = "WASD: Move   Space: Jump   LMB/RMB/Shift: Cast slots   Scroll: Browse spells   1/2/3: Assign browsed spell   ESC: Menu   F11: Fullscreen"
 	_hint_label.add_theme_font_size_override("font_size", 12)
 	_hint_label.add_theme_color_override("font_color", Color(0.8, 0.8, 0.8, 0.6))
 
@@ -337,6 +445,13 @@ func _build_pause_overlay() -> void:
 	spell_creator_btn.text = "Spell Creator"
 	spell_creator_btn.pressed.connect(_go_to_spell_creator)
 	vbox.add_child(spell_creator_btn)
+
+	_fullscreen_btn = Button.new()
+	_update_fullscreen_button()
+	_fullscreen_btn.pressed.connect(GameSettings.toggle_fullscreen)
+	vbox.add_child(_fullscreen_btn)
+	if not GameSettings.fullscreen_changed.is_connected(_on_fullscreen_changed):
+		GameSettings.fullscreen_changed.connect(_on_fullscreen_changed)
 
 	var main_menu_btn := Button.new()
 	main_menu_btn.text = "Main Menu"
@@ -445,6 +560,8 @@ func _unhandled_input(event: InputEvent) -> void:
 				_cancel_charged_sphere()
 				_stop_beam()
 				_toggle_pause()
+			KEY_F11:
+				GameSettings.toggle_fullscreen()
 			KEY_SHIFT:
 				_try_cast_slot(2)
 			KEY_1, KEY_2, KEY_3:
@@ -467,6 +584,16 @@ func _toggle_pause() -> void:
 func _on_resume() -> void:
 	_pause_overlay.visible = false
 	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+
+
+func _on_fullscreen_changed(_enabled: bool) -> void:
+	_update_fullscreen_button()
+
+
+func _update_fullscreen_button() -> void:
+	if _fullscreen_btn == null:
+		return
+	_fullscreen_btn.text = "Windowed" if GameSettings.is_fullscreen() else "Fullscreen"
 
 
 func _go_to_spell_creator() -> void:
@@ -608,9 +735,10 @@ func _get_spell_output_text(spell: SpellDefinition) -> String:
 	var push_suffix := " + %.1f push" % spell.calculate_push_force(false) if spell.calculate_push_force(false) > 0.0 else ""
 	var gravity_suffix := " + %.1f gravity" % spell.calculate_gravity_force(0.0, 3.0, false) if spell.calculate_gravity_force(0.0, 3.0, false) > 0.0 else ""
 	var blind_suffix := " + %.1fs blind" % spell.calculate_blind_duration(false) if spell.calculate_blind_duration(false) > 0.0 else ""
+	var wall_suffix := " + %ds wall" % spell.wall_time if spell.shape == "Wall" else ""
 	if spell.is_healing_spell():
-		return ("%d/tick heal" % spell.calculate_healing(true) if spell.shape == "Beam" else "%d heal" % spell.calculate_healing()) + push_suffix + gravity_suffix + blind_suffix
-	return ("%d/tick" % spell.calculate_damage(true) if spell.shape == "Beam" else "%d dmg" % spell.calculate_damage()) + push_suffix + gravity_suffix + blind_suffix
+		return ("%d/tick heal" % spell.calculate_healing(true) if spell.shape == "Beam" else "%d heal" % spell.calculate_healing()) + push_suffix + gravity_suffix + blind_suffix + wall_suffix
+	return ("%d/tick" % spell.calculate_damage(true) if spell.shape == "Beam" else "%d dmg" % spell.calculate_damage()) + push_suffix + gravity_suffix + blind_suffix + wall_suffix
 
 
 func _try_cast_slot(slot_index: int) -> void:
@@ -628,10 +756,11 @@ func _try_cast_slot(slot_index: int) -> void:
 		_start_beam(spell)
 		return
 	if spell.is_healing_spell() and not (spell.shape == "Sphere" and spell.has_charging):
-		if not _spend_mana(spell.calculate_mana_cost()):
+		var mana_cost := spell.calculate_mana_cost()
+		if not _spend_mana(mana_cost):
 			return
 		_cast_timer = CAST_COOLDOWN
-		_cast_self_effect_spell(spell)
+		_cast_self_effect_spell(spell, mana_cost)
 		return
 	if spell.shape == "Sphere" and spell.has_charging:
 		if not _spend_mana(spell.calculate_charged_mana_cost(spell.spell_size)):
@@ -681,6 +810,7 @@ func _start_beam(spell: SpellDefinition) -> void:
 	_beam_light.light_energy = 1.0 + spell.intensity * 0.4
 	_beam_light.omni_range = 3.0 + spell.spell_size * 0.4
 	_active_beam.add_child(_beam_light)
+	_broadcast_beam_start(spell)
 	_update_beam()
 
 
@@ -695,6 +825,32 @@ func _stop_beam() -> void:
 	_beam_core = null
 	_beam_tip = null
 	_beam_light = null
+	_server_beam_correction_time = -1.0
+	var world := get_tree().current_scene
+	if world != null and world.has_method("unregister_beam_segment"):
+		world.unregister_beam_segment(_get_beam_source_key())
+	_broadcast_beam_stop()
+
+
+func stop_beam(broadcast: bool = true) -> void:
+	if broadcast:
+		_stop_beam()
+	else:
+		# Stop beam without broadcasting RPCs (for cleanup during despawn)
+		if _active_beam == null:
+			return
+		_active_beam.queue_free()
+		_active_beam = null
+		_active_beam_spell = null
+		_beam_visible_length = 0.0
+		_beam_impact_timer = 0.0
+		_beam_core = null
+		_beam_tip = null
+		_beam_light = null
+		_server_beam_correction_time = -1.0
+		var world := get_tree().current_scene
+		if world != null and world.has_method("unregister_beam_segment"):
+			world.unregister_beam_segment(_get_beam_source_key())
 
 
 func _update_beam() -> void:
@@ -721,6 +877,17 @@ func _update_beam() -> void:
 	_beam_visible_length = move_toward(_beam_visible_length, target_length, propagation_speed * get_physics_process_delta_time())
 	var length: float = minf(target_length, maxf(0.1, _beam_visible_length))
 	var visible_target: Vector3 = origin + direction * length
+	var beam_blocked_by_spell := false
+	var world := get_tree().current_scene
+	if world != null and world.has_method("resolve_beam_segment") and not _is_network_client():
+		var beam_result: Dictionary = world.resolve_beam_segment(_get_beam_source_key(), _active_beam_spell, origin, visible_target, self)
+		visible_target = beam_result.get("target", visible_target) as Vector3
+		beam_blocked_by_spell = bool(beam_result.get("blocked", false))
+		length = maxf(0.1, origin.distance_to(visible_target))
+	elif _is_network_client() and _network_time() - _server_beam_correction_time < 0.12 and origin.distance_to(_server_beam_origin) < 1.2:
+		visible_target = _server_beam_target
+		beam_blocked_by_spell = origin.distance_to(visible_target) + 0.05 < target_length
+		length = maxf(0.1, origin.distance_to(visible_target))
 	var midpoint: Vector3 = origin.lerp(visible_target, 0.5)
 	var thickness: float = 0.08 + (_active_beam_spell.spell_size - 1) * 0.025
 
@@ -739,8 +906,9 @@ func _update_beam() -> void:
 	_beam_tip.global_position = visible_target
 	_beam_tip.scale = Vector3.ONE * (0.7 + thickness * 4.0 + pulse_strength * pulse)
 	_beam_light.global_position = visible_target
+	_broadcast_beam_update(origin, visible_target)
 
-	if has_hit and length >= target_length - 0.05 and _beam_impact_timer <= 0.0:
+	if has_hit and not beam_blocked_by_spell and _find_spell_wall_node(hit.get("collider")) == null and length >= target_length - 0.05 and _beam_impact_timer <= 0.0:
 		if _is_network_client():
 			_server_beam_tick.rpc_id(1, SpellNetworkCodecScript.to_dict(_active_beam_spell), origin, direction)
 		else:
@@ -766,6 +934,196 @@ func _get_beam_propagation_speed(spell_speed: int) -> float:
 	return 1.8 + pow(float(spell_speed), 1.55) * 2.1
 
 
+func _get_beam_source_key() -> String:
+	return "player:%d" % _network_peer_id
+
+
+func _find_spell_wall_node(value: Variant) -> Node:
+	var node := value as Node
+	while node != null:
+		if node.has_method("is_spell_wall") and bool(node.is_spell_wall()):
+			return node
+		node = node.get_parent()
+	return null
+
+
+func _broadcast_beam_start(spell: SpellDefinition) -> void:
+	if multiplayer.multiplayer_peer == null:
+		return
+	var spell_data := SpellNetworkCodecScript.to_dict(spell)
+	if multiplayer.is_server():
+		_client_start_beam_visual.rpc(spell_data, _network_peer_id)
+	else:
+		_server_start_beam_visual.rpc_id(1, spell_data)
+
+
+func _broadcast_beam_update(origin: Vector3, target: Vector3) -> void:
+	if multiplayer.multiplayer_peer == null:
+		return
+	if multiplayer.is_server():
+		_client_update_beam_visual.rpc(origin, target, _network_peer_id, false)
+	else:
+		_server_update_beam_visual.rpc_id(1, origin, target)
+
+
+func _broadcast_beam_stop() -> void:
+	if multiplayer.multiplayer_peer == null:
+		return
+	if multiplayer.is_server():
+		_client_stop_beam_visual.rpc(_network_peer_id)
+	else:
+		_server_stop_beam_visual.rpc_id(1)
+
+
+@rpc("any_peer", "reliable")
+func _server_start_beam_visual(spell_data: Dictionary) -> void:
+	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
+		return
+	# Check if node is still in scene tree (may have been despawned)
+	if not is_inside_tree():
+		return
+	_client_start_beam_visual.rpc(spell_data, _network_peer_id)
+	_start_remote_beam_visual(SpellNetworkCodecScript.from_dict(spell_data))
+
+
+@rpc("any_peer", "unreliable")
+func _server_update_beam_visual(origin: Vector3, target: Vector3) -> void:
+	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
+		return
+	# Check if node is still in scene tree (may have been despawned)
+	if not is_inside_tree():
+		return
+	var broadcast_target := target
+	var broadcast_blocked := false
+	var world := get_tree().current_scene
+	if world != null and world.has_method("resolve_beam_segment") and _remote_beam_spell != null:
+		var beam_result: Dictionary = world.resolve_beam_segment(_get_beam_source_key(), _remote_beam_spell, origin, target, self)
+		broadcast_target = beam_result.get("target", target) as Vector3
+		broadcast_blocked = bool(beam_result.get("blocked", false))
+	_client_update_beam_visual.rpc(origin, broadcast_target, _network_peer_id, broadcast_blocked)
+	_update_remote_beam_visual(origin, broadcast_target)
+
+
+@rpc("any_peer", "reliable")
+func _server_stop_beam_visual() -> void:
+	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
+		return
+	# Check if node is still in scene tree (may have been despawned)
+	if not is_inside_tree():
+		return
+	var world := get_tree().current_scene
+	if world != null and world.has_method("unregister_beam_segment"):
+		world.unregister_beam_segment(_get_beam_source_key())
+	_client_stop_beam_visual.rpc(_network_peer_id)
+	_stop_remote_beam_visual()
+
+
+@rpc("any_peer", "reliable")
+func _client_start_beam_visual(spell_data: Dictionary, source_peer_id: int) -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+		return
+	if source_peer_id == multiplayer.get_unique_id():
+		return
+	_start_remote_beam_visual(SpellNetworkCodecScript.from_dict(spell_data))
+
+
+@rpc("any_peer", "unreliable")
+func _client_update_beam_visual(origin: Vector3, target: Vector3, source_peer_id: int, source_blocked: bool = false) -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+		return
+	if source_peer_id == multiplayer.get_unique_id():
+		if source_blocked:
+			_server_beam_origin = origin
+			_server_beam_target = target
+			_server_beam_correction_time = _network_time()
+		return
+	_update_remote_beam_visual(origin, target)
+
+
+@rpc("any_peer", "reliable")
+func _client_stop_beam_visual(source_peer_id: int) -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+		return
+	if source_peer_id == multiplayer.get_unique_id():
+		return
+	_stop_remote_beam_visual()
+
+
+func _start_remote_beam_visual(spell: SpellDefinition) -> void:
+	_stop_remote_beam_visual()
+	_remote_beam_spell = spell
+	_remote_beam = Node3D.new()
+	get_tree().current_scene.add_child(_remote_beam)
+
+	var col: Color = _get_spell_color(spell)
+	var core_mat := StandardMaterial3D.new()
+	core_mat.albedo_color = col
+	core_mat.emission_enabled = true
+	core_mat.emission = col
+	core_mat.emission_energy_multiplier = 2.0 + spell.intensity * 0.25
+
+	_remote_beam_core = MeshInstance3D.new()
+	_remote_beam_core.mesh = CylinderMesh.new()
+	_remote_beam_core.material_override = core_mat
+	_remote_beam.add_child(_remote_beam_core)
+
+	var tip_mesh := SphereMesh.new()
+	tip_mesh.radius = 0.18
+	tip_mesh.height = 0.36
+	_remote_beam_tip = MeshInstance3D.new()
+	_remote_beam_tip.mesh = tip_mesh
+	_remote_beam_tip.material_override = core_mat
+	_remote_beam.add_child(_remote_beam_tip)
+
+	_remote_beam_light = OmniLight3D.new()
+	_remote_beam_light.light_color = col
+	_remote_beam_light.light_energy = 1.0 + spell.intensity * 0.4
+	_remote_beam_light.omni_range = 3.0 + spell.spell_size * 0.4
+	_remote_beam.add_child(_remote_beam_light)
+	_remote_beam_last_update_time = _network_time()
+
+
+func _update_remote_beam_visual(origin: Vector3, target: Vector3) -> void:
+	if _remote_beam == null or _remote_beam_spell == null:
+		return
+	_remote_beam_origin = origin
+	_remote_beam_target = target
+	_remote_beam_last_update_time = _network_time()
+	_apply_remote_beam_transform()
+
+
+func _apply_remote_beam_transform() -> void:
+	if _remote_beam_core == null or _remote_beam_tip == null or _remote_beam_light == null or _remote_beam_spell == null:
+		return
+	var length: float = maxf(0.1, _remote_beam_origin.distance_to(_remote_beam_target))
+	var midpoint: Vector3 = _remote_beam_origin.lerp(_remote_beam_target, 0.5)
+	var thickness: float = 0.08 + (_remote_beam_spell.spell_size - 1) * 0.025
+	var mesh := _remote_beam_core.mesh as CylinderMesh
+	mesh.top_radius = thickness
+	mesh.bottom_radius = thickness
+	mesh.height = length
+	_remote_beam_core.global_position = midpoint
+	_remote_beam_core.look_at(_remote_beam_target, Vector3.UP)
+	_remote_beam_core.rotate_object_local(Vector3.RIGHT, PI / 2.0)
+	var pulse_rate: float = 0.004 + _remote_beam_spell.spell_speed * 0.012
+	var pulse_strength: float = 0.12 + _remote_beam_spell.spell_speed * 0.018
+	var pulse := 1.0 + sin(Time.get_ticks_msec() * pulse_rate) * pulse_strength
+	_remote_beam_core.scale = Vector3(pulse, 1.0, pulse)
+	_remote_beam_tip.global_position = _remote_beam_target
+	_remote_beam_tip.scale = Vector3.ONE * (0.7 + thickness * 4.0 + pulse_strength * pulse)
+	_remote_beam_light.global_position = _remote_beam_target
+
+
+func _stop_remote_beam_visual() -> void:
+	if _remote_beam != null:
+		_remote_beam.queue_free()
+	_remote_beam = null
+	_remote_beam_spell = null
+	_remote_beam_core = null
+	_remote_beam_tip = null
+	_remote_beam_light = null
+
+
 func _get_spell_color(spell: SpellDefinition) -> Color:
 	var weights := spell.get_base_weights()
 	if weights.is_empty():
@@ -781,23 +1139,31 @@ func _get_spell_color(spell: SpellDefinition) -> Color:
 	return color / total_weight
 
 
-func _spawn_spell_impact(spell: SpellDefinition, position: Vector3, normal: Vector3) -> void:
+func _spawn_spell_impact(spell: SpellDefinition, position: Vector3, normal: Vector3, broadcast_to_clients: bool = true, visual_only: bool = false) -> void:
 	var effect := SpellImpactEffectScript.new()
 	get_tree().current_scene.add_child(effect)
 	effect.initialize(spell, position, normal, self)
+	effect.set_visual_only(visual_only)
+	var world := get_tree().current_scene
+	if broadcast_to_clients and multiplayer.multiplayer_peer != null and multiplayer.is_server() and world != null and world.has_method("broadcast_spell_impact"):
+		world.broadcast_spell_impact(spell, position, normal)
 
 
 func _cast_projectile_spell(spell: SpellDefinition, from: Vector3, direction: Vector3) -> void:
 	if _is_network_client():
+		var world := get_tree().current_scene
+		if world != null and world.has_method("remember_predicted_projectile"):
+			world.remember_predicted_projectile(spell, from, direction)
 		_spawn_projectile_local(spell, from, direction, self)
 		_server_cast_projectile.rpc_id(1, SpellNetworkCodecScript.to_dict(spell), from, direction, _network_time())
 		return
 	_spawn_projectile_for_all(spell, from, direction)
 
 
-func _cast_self_effect_spell(spell: SpellDefinition) -> void:
+func _cast_self_effect_spell(spell: SpellDefinition, mana_cost_paid: float = -1.0) -> void:
+	var mana_cost := mana_cost_paid if mana_cost_paid >= 0.0 else float(spell.calculate_mana_cost())
 	if _is_network_client():
-		_server_cast_self_effect.rpc_id(1, SpellNetworkCodecScript.to_dict(spell))
+		_server_cast_self_effect.rpc_id(1, SpellNetworkCodecScript.to_dict(spell), mana_cost)
 		return
 	_apply_self_effect_for_all(spell)
 
@@ -810,10 +1176,16 @@ func _server_cast_projectile(spell_data: Dictionary, from: Vector3, direction: V
 
 
 @rpc("any_peer", "reliable")
-func _server_cast_self_effect(spell_data: Dictionary) -> void:
+func _server_cast_self_effect(spell_data: Dictionary, mana_cost_paid: float = -1.0) -> void:
 	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
 		return
-	_apply_self_effect_for_all(SpellNetworkCodecScript.from_dict(spell_data))
+	var spell := SpellNetworkCodecScript.from_dict(spell_data)
+	var mana_cost := mana_cost_paid if mana_cost_paid >= 0.0 else float(spell.calculate_mana_cost())
+	if not _spend_mana(mana_cost):
+		_broadcast_combat_state()
+		return
+	_apply_self_effect_for_all(spell)
+	_broadcast_combat_state()
 
 
 @rpc("any_peer", "reliable")
@@ -832,6 +1204,13 @@ func _server_beam_tick(spell_data: Dictionary, origin: Vector3, direction: Vecto
 		return
 	var hit_position := hit["position"] as Vector3
 	var hit_normal := hit["normal"] as Vector3
+	var world := get_tree().current_scene
+	if world != null and world.has_method("get_registered_beam_target"):
+		var beam_target: Vector3 = world.get_registered_beam_target(_get_beam_source_key(), hit_position)
+		if origin.distance_to(beam_target) + 0.05 < origin.distance_to(hit_position):
+			return
+	if _find_spell_wall_node(hit.get("collider")) != null:
+		return
 	_apply_spell_hit_to_collider(hit.get("collider"), spell, hit_position, hit_normal, true)
 	_apply_push_recoil(spell, hit_position, hit_normal, true)
 	_spawn_spell_impact(spell, hit_position, hit_normal)
@@ -877,7 +1256,8 @@ func _client_apply_self_effect(spell_data: Dictionary, source_peer_id: int) -> v
 
 func _apply_self_effect_local(spell: SpellDefinition) -> void:
 	_heal(spell.calculate_healing(false))
-	_spawn_spell_impact(spell, global_position + Vector3.UP * 0.7, Vector3.UP)
+	var visual_only := multiplayer.multiplayer_peer != null and not multiplayer.is_server()
+	_spawn_spell_impact(spell, global_position + Vector3.UP * 0.7, Vector3.UP, false, visual_only)
 
 
 func _find_network_player(peer_id: int) -> Node:
@@ -905,6 +1285,8 @@ func _find_damageable_node(value: Object) -> Node:
 	var node := value as Node
 	while node != null:
 		if node.has_method("apply_spell_hit"):
+			if node.has_method("is_damageable") and not bool(node.is_damageable()):
+				return null
 			return node
 		node = node.get_parent()
 	return null
@@ -940,10 +1322,11 @@ func _release_charged_sphere() -> void:
 		return
 
 	var charged_spell := _create_charged_sphere_spell()
+	var charged_mana_cost := _charging_sphere_spell.calculate_charged_mana_cost(_charging_sphere_paid_size)
 	_cancel_charged_sphere()
 	_cast_timer = CAST_COOLDOWN
 	if charged_spell.is_healing_spell():
-		_cast_self_effect_spell(charged_spell)
+		_cast_self_effect_spell(charged_spell, charged_mana_cost)
 		return
 
 	_cast_projectile_spell(charged_spell, _get_cast_origin(), _get_aim_direction())
@@ -997,6 +1380,7 @@ func _create_charged_sphere_spell() -> SpellDefinition:
 	spell.spell_size = _get_charged_sphere_size()
 	spell.spell_range = _charging_sphere_spell.spell_range
 	spell.spell_speed = _charging_sphere_spell.spell_speed
+	spell.wall_time = _charging_sphere_spell.wall_time
 	spell.has_charging = _charging_sphere_spell.has_charging
 	spell.burns = _charging_sphere_spell.burns
 	spell.cools = _charging_sphere_spell.cools
@@ -1067,6 +1451,10 @@ func _update_mana_hud() -> void:
 func apply_spell_hit(spell: SpellDefinition, _hit_position: Vector3, _hit_normal: Vector3, is_beam_tick: bool = false) -> void:
 	if spell == null or _is_dead:
 		return
+	if spell.cools:
+		_clear_burn()
+	if spell.burns and not spell.is_healing_spell():
+		_apply_burn(spell, is_beam_tick)
 	if spell.is_blind_spell():
 		apply_blind(spell.calculate_blind_duration(is_beam_tick))
 	_apply_pushback(spell, _hit_position, _hit_normal, is_beam_tick)
@@ -1104,11 +1492,53 @@ func _take_damage(amount: int) -> void:
 		_die()
 
 
+func _apply_burn(spell: SpellDefinition, is_beam_tick: bool) -> void:
+	var damage_basis: int = spell.calculate_damage(is_beam_tick)
+	var tick_damage: int = maxi(1, int(round(float(damage_basis) * BURN_DAMAGE_SCALE)))
+	_burn_timer = maxf(_burn_timer, BURN_DURATION)
+	_burn_tick_damage = maxi(_burn_tick_damage, tick_damage)
+	if _burn_tick_timer <= 0.0:
+		_burn_tick_timer = BURN_TICK_INTERVAL
+
+
+func _clear_burn() -> void:
+	_burn_timer = 0.0
+	_burn_tick_timer = 0.0
+	_burn_tick_damage = 0
+
+
+func _tick_burn_status(delta: float) -> bool:
+	if _burn_timer <= 0.0 or _burn_tick_damage <= 0 or _is_dead:
+		_clear_burn()
+		return false
+	_burn_timer = maxf(0.0, _burn_timer - delta)
+	_burn_tick_timer -= delta
+	if _burn_tick_timer > 0.0:
+		if _burn_timer <= 0.0:
+			_clear_burn()
+		return false
+	_burn_tick_timer = BURN_TICK_INTERVAL
+	_take_damage(_burn_tick_damage)
+	if _burn_timer <= 0.0 or _is_dead:
+		_clear_burn()
+	return true
+
+
 func _heal(amount: int) -> void:
 	if amount <= 0:
 		return
 	_health = mini(MAX_HEALTH, _health + amount)
 	_update_health_hud()
+
+
+func _apply_fall_damage(fall_distance: float) -> bool:
+	if _is_dead or fall_distance <= FALL_DAMAGE_SAFE_HEIGHT:
+		return false
+	var damage := int(round((fall_distance - FALL_DAMAGE_SAFE_HEIGHT) * FALL_DAMAGE_PER_METER))
+	if damage <= 0:
+		return false
+	_take_damage(damage)
+	return true
 
 
 func _apply_pushback(spell: SpellDefinition, hit_position: Vector3, hit_normal: Vector3, is_beam_tick: bool) -> void:
@@ -1130,6 +1560,14 @@ func _apply_push_recoil(spell: SpellDefinition, hit_position: Vector3, hit_norma
 	var force := spell.calculate_push_force(is_beam_tick) * PUSH_RECOIL_SCALE
 	if force <= 0.0:
 		return
+	var horizontal_offset := global_position - hit_position
+	horizontal_offset.y = 0.0
+	var distance := horizontal_offset.length()
+	var recoil_radius := PUSH_RECOIL_BASE_RADIUS + float(spell.spell_size) * PUSH_RECOIL_SIZE_RADIUS_SCALE
+	if distance > recoil_radius:
+		return
+	var falloff := 1.0 - clampf(distance / recoil_radius, 0.0, 1.0)
+	force *= falloff
 	var recoil_dir := global_position - hit_position
 	recoil_dir.y = 0.0
 	if recoil_dir.length_squared() < 0.01:
@@ -1164,10 +1602,98 @@ func _update_health_hud() -> void:
 		_health_label.text = "Health  %d / %d" % [_health, MAX_HEALTH]
 
 
+func _tick_blind_timer(delta: float, update_overlay: bool) -> void:
+	if _blind_timer <= 0.0:
+		return
+	_blind_timer = maxf(0.0, _blind_timer - delta)
+	if _blind_timer <= 0.0:
+		_blind_duration = 0.0
+	if update_overlay:
+		_update_blind_overlay()
+
+
+func _start_death_animation() -> void:
+	_death_anim_time = 0.0
+	_death_anim_active = true
+	if _body_mesh != null:
+		_body_mesh.visible = true
+	if _hand_mesh != null:
+		_hand_mesh.visible = true
+	if _death_burst != null:
+		_death_burst.visible = true
+		_death_burst.scale = Vector3.ONE * 0.1
+
+
+func _reset_death_animation() -> void:
+	_death_anim_time = 0.0
+	_death_anim_active = false
+	if _visual_root != null:
+		_visual_root.position = Vector3.ZERO
+		_visual_root.rotation = Vector3.ZERO
+		_visual_root.scale = Vector3.ONE
+	if _body_mesh != null:
+		_body_mesh.visible = true
+	if _hand_mesh != null:
+		_hand_mesh.visible = true
+		_hand_mesh.scale = Vector3.ONE
+	if _body_material != null:
+		var body_col := _player_color
+		body_col.a = 1.0
+		_body_material.albedo_color = body_col
+		_body_material.emission = _player_color
+		_body_material.emission_energy_multiplier = 0.12
+	if _hand_material != null:
+		_hand_material.albedo_color = Color(0.55, 0.46, 0.38, 1.0)
+	if _death_burst != null:
+		_death_burst.visible = false
+		_death_burst.scale = Vector3.ONE * 0.1
+	if _death_burst_material != null:
+		_death_burst_material.albedo_color = Color(_player_color.r, _player_color.g, _player_color.b, 0.0)
+		_death_burst_material.emission_energy_multiplier = 0.0
+
+
+func _update_death_animation(delta: float) -> void:
+	if not _death_anim_active:
+		return
+	_death_anim_time = minf(_death_anim_time + delta, DEATH_ANIMATION_DURATION)
+	var t := clampf(_death_anim_time / DEATH_ANIMATION_DURATION, 0.0, 1.0)
+	var slump := ease(t, -1.6)
+	var fade := 1.0 - t
+	if _visual_root != null:
+		_visual_root.rotation.z = lerpf(0.0, deg_to_rad(82.0), slump)
+		_visual_root.rotation.x = lerpf(0.0, deg_to_rad(-14.0), slump)
+		_visual_root.position = Vector3(0.0, lerpf(0.0, -0.34, slump), 0.0)
+		_visual_root.scale = Vector3.ONE * lerpf(1.0, 0.82, t)
+	if _hand_mesh != null:
+		_hand_mesh.scale = Vector3.ONE * lerpf(1.0, 0.25, t)
+	if _body_material != null:
+		var body_col := _player_color
+		body_col.a = lerpf(1.0, 0.12, t)
+		_body_material.albedo_color = body_col
+		_body_material.emission_energy_multiplier = lerpf(0.12, 1.3, 1.0 - absf(t - 0.22) / 0.22) if t <= 0.44 else lerpf(0.32, 0.0, (t - 0.44) / 0.56)
+	if _hand_material != null:
+		_hand_material.albedo_color = Color(0.55, 0.46, 0.38, lerpf(1.0, 0.0, t))
+	if _death_burst != null:
+		_death_burst.scale = Vector3.ONE * lerpf(0.1, 2.1, ease(t, -2.0))
+	if _death_burst_material != null:
+		var burst_alpha := sin(t * PI) * 0.42
+		_death_burst_material.albedo_color = Color(_player_color.r, _player_color.g, _player_color.b, burst_alpha)
+		_death_burst_material.emission_energy_multiplier = sin(t * PI) * 1.6
+	if _death_anim_time >= DEATH_ANIMATION_DURATION:
+		_death_anim_active = false
+		if _body_mesh != null:
+			_body_mesh.visible = false
+		if _hand_mesh != null:
+			_hand_mesh.visible = false
+		if _death_burst != null:
+			_death_burst.visible = false
+
+
 func _die() -> void:
 	if _is_dead:
 		return
 	_is_dead = true
+	_start_death_animation()
 	_respawn_timer = RESPAWN_DELAY
 	_cancel_charged_sphere()
 	_stop_beam()
@@ -1175,6 +1701,7 @@ func _die() -> void:
 	_external_velocity = Vector3.ZERO
 	_blind_timer = 0.0
 	_blind_duration = 0.0
+	_clear_burn()
 	_update_blind_overlay()
 	if _death_label != null:
 		_death_label.visible = true
@@ -1183,15 +1710,25 @@ func _die() -> void:
 
 func _respawn() -> void:
 	_is_dead = false
+	_reset_death_animation()
 	_kill_zone_respawn_timer = -1.0
 	_health = MAX_HEALTH
 	_mana = MAX_MANA
 	global_position = _respawn_position
 	velocity = Vector3.ZERO
 	_external_velocity = Vector3.ZERO
+	_was_on_floor_last_frame = true
+	_fall_peak_y = global_position.y
+	_server_was_falling = false
+	_server_fall_peak_y = global_position.y
+	_server_previous_pos = global_position
+	_server_previous_velocity = Vector3.ZERO
+	_server_has_previous_motion = false
+	_jump_was_pressed_last_frame = false
 	_server_state_lock_timer = 0.35
 	_blind_timer = 0.0
 	_blind_duration = 0.0
+	_clear_burn()
 	_update_blind_overlay()
 	_update_health_hud()
 	_update_mana_hud()
@@ -1202,11 +1739,20 @@ func _respawn() -> void:
 
 
 func _physics_process(delta: float) -> void:
+	var was_on_floor_at_start := is_on_floor()
 	if _server_state_lock_timer > 0.0:
 		_server_state_lock_timer = maxf(0.0, _server_state_lock_timer - delta)
+	if not _is_dead:
+		_decay_external_velocity(delta)
 	if not _is_local_player:
-		if multiplayer.multiplayer_peer != null and multiplayer.is_server() and _is_dead:
-			_tick_server_respawn(delta)
+		if multiplayer.multiplayer_peer != null and multiplayer.is_server():
+			if _is_dead:
+				_tick_server_respawn(delta)
+			else:
+				_restore_mana(MANA_REGEN_PER_SECOND * delta)
+				_tick_blind_timer(delta, false)
+				if _tick_burn_status(delta):
+					_broadcast_combat_state()
 		return
 	if _cast_timer > 0.0:
 		_cast_timer -= delta
@@ -1230,19 +1776,25 @@ func _physics_process(delta: float) -> void:
 		return
 	if _active_beam == null and _charging_sphere_spell == null:
 		_restore_mana(MANA_REGEN_PER_SECOND * delta)
-	_external_velocity = _external_velocity.move_toward(Vector3.ZERO, 12.0 * delta)
-	if _blind_timer > 0.0:
-		_blind_timer = maxf(0.0, _blind_timer - delta)
-		_update_blind_overlay()
+	_tick_blind_timer(delta, true)
+	if _tick_burn_status(delta) and multiplayer.multiplayer_peer != null and multiplayer.is_server():
+		_broadcast_combat_state()
 
 	if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 		_cancel_charged_sphere()
 		_stop_beam()
+		_jump_was_pressed_last_frame = Input.is_key_pressed(KEY_SPACE)
 		velocity.x = move_toward(velocity.x, 0, SPEED)
 		velocity.z = move_toward(velocity.z, 0, SPEED)
 		if not is_on_floor():
 			velocity.y -= GRAVITY * delta
+		var pre_slide_vy := velocity.y
+		var pre_slide_y := global_position.y
 		move_and_slide()
+		if pre_slide_vy < 0.0:
+			if velocity.y > 0.0 or (pre_slide_y - global_position.y) < absf(pre_slide_vy * delta) * 0.5:
+				velocity.y = 0.0
+		_update_local_fall_damage_after_move(was_on_floor_at_start)
 		_sync_network_state(delta)
 		return
 
@@ -1258,8 +1810,10 @@ func _physics_process(delta: float) -> void:
 	if not is_on_floor():
 		velocity.y -= GRAVITY * delta
 
-	if Input.is_key_pressed(KEY_SPACE) and is_on_floor():
+	var jump_pressed := Input.is_key_pressed(KEY_SPACE)
+	if jump_pressed and not _jump_was_pressed_last_frame and is_on_floor():
 		velocity.y = JUMP_VELOCITY
+	_jump_was_pressed_last_frame = jump_pressed
 
 	var move_dir := Vector2.ZERO
 	if Input.is_key_pressed(KEY_W): move_dir.y -= 1
@@ -1277,9 +1831,58 @@ func _physics_process(delta: float) -> void:
 	if _external_velocity.y > 0.0:
 		velocity.y = maxf(velocity.y, _external_velocity.y)
 
+	var pre_slide_vy := velocity.y
+	var pre_slide_y := global_position.y
 	move_and_slide()
+	if pre_slide_vy < 0.0:
+		if velocity.y > 0.0 or (pre_slide_y - global_position.y) < absf(pre_slide_vy * delta) * 0.5:
+			velocity.y = 0.0
+	_update_local_fall_damage_after_move(was_on_floor_at_start)
 	_record_server_position()
 	_sync_network_state(delta)
+
+
+func _update_local_fall_damage_after_move(was_on_floor_at_start: bool) -> void:
+	var now_on_floor := is_on_floor()
+	if now_on_floor:
+		velocity.y = 0.0
+		if not was_on_floor_at_start:
+			_external_velocity.y = 0.0
+	var is_network_client := false
+	if multiplayer.multiplayer_peer != null:
+		var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+		is_network_client = peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED and not multiplayer.is_server()
+	
+	if is_network_client:
+		if now_on_floor and not _was_on_floor_last_frame:
+			_absorb_landing_momentum(maxf(0.0, _fall_peak_y - global_position.y))
+		_was_on_floor_last_frame = now_on_floor
+		_fall_peak_y = global_position.y if now_on_floor else maxf(_fall_peak_y, global_position.y)
+		return
+	if was_on_floor_at_start and not now_on_floor:
+		_fall_peak_y = global_position.y
+	elif not now_on_floor:
+		_fall_peak_y = maxf(_fall_peak_y, global_position.y)
+	elif not _was_on_floor_last_frame:
+		var fall_distance := maxf(0.0, _fall_peak_y - global_position.y)
+		_absorb_landing_momentum(fall_distance)
+		if _apply_fall_damage(fall_distance) and multiplayer.multiplayer_peer != null and multiplayer.is_server():
+			_broadcast_combat_state()
+		_fall_peak_y = global_position.y
+	elif now_on_floor:
+		_fall_peak_y = global_position.y
+	_was_on_floor_last_frame = now_on_floor
+
+
+func _absorb_landing_momentum(fall_distance: float) -> void:
+	if fall_distance < HARD_LANDING_MOMENTUM_CANCEL_HEIGHT:
+		return
+	velocity = Vector3.ZERO
+	_external_velocity = Vector3.ZERO
+
+
+func _decay_external_velocity(delta: float) -> void:
+	_external_velocity = _external_velocity.move_toward(Vector3.ZERO, 12.0 * delta)
 
 
 func _tick_server_respawn(delta: float) -> void:
@@ -1331,9 +1934,21 @@ func _sync_network_state(delta: float) -> void:
 	_net_send_timer = 0.0
 	var head_pitch := _head.rotation.x if _head != null else 0.0
 	var timestamp := _network_time()
-	if multiplayer.is_server():
+	
+	var is_connected := false
+	var is_server := false
+	if multiplayer.multiplayer_peer != null:
+		var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+		is_connected = peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED
+		is_server = is_connected and multiplayer.is_server()
+	
+	if is_server:
+		var world := get_tree().current_scene
+		if world != null and world.has_method("broadcast_player_transform_state"):
+			world.broadcast_player_transform_state(_network_peer_id, global_position, velocity, rotation.y, head_pitch, timestamp)
+			return
 		_client_receive_player_state.rpc(_network_peer_id, global_position, velocity, rotation.y, head_pitch, timestamp)
-	else:
+	elif is_connected:
 		_server_receive_player_state.rpc_id(1, global_position, velocity, rotation.y, head_pitch, timestamp)
 
 
@@ -1348,6 +1963,10 @@ func _force_network_transform_sync() -> void:
 	if multiplayer.multiplayer_peer == null or not multiplayer.is_server():
 		return
 	var head_pitch := _head.rotation.x if _head != null else 0.0
+	var world := get_tree().current_scene
+	if world != null and world.has_method("broadcast_player_transform_state"):
+		world.broadcast_player_transform_state(_network_peer_id, global_position, velocity, rotation.y, head_pitch, _network_time())
+		return
 	_client_receive_player_state.rpc(_network_peer_id, global_position, velocity, rotation.y, head_pitch, _network_time())
 
 
@@ -1411,17 +2030,24 @@ func _apply_combat_state(
 	pos: Vector3,
 	external_velocity: Vector3
 ) -> void:
+	var was_dead := _is_dead
 	_health = health
 	_mana = mana
 	_is_dead = is_dead
+	if _is_dead and not was_dead:
+		_start_death_animation()
+	elif not _is_dead and was_dead:
+		_reset_death_animation()
 	_respawn_timer = respawn_timer
 	_kill_zone_respawn_timer = -1.0
 	_blind_timer = blind_timer
 	_blind_duration = blind_duration
-	global_position = pos
-	_remote_snapshots.clear()
+	var should_snap_position := not _is_local_player or _is_dead or global_position.distance_to(pos) > 1.5
+	if should_snap_position:
+		global_position = pos
+		_remote_snapshots.clear()
 	_external_velocity = external_velocity
-	if not _is_dead and health == MAX_HEALTH:
+	if should_snap_position and not _is_dead and health == MAX_HEALTH:
 		velocity = Vector3.ZERO
 		if external_velocity.length_squared() <= 0.001:
 			_external_velocity = Vector3.ZERO
@@ -1448,16 +2074,68 @@ func apply_network_combat_state(
 	_apply_combat_state(health, mana, is_dead, respawn_timer, blind_timer, blind_duration, pos, external_velocity)
 
 
+func apply_network_transform_state(peer_id: int, pos: Vector3, net_velocity: Vector3, yaw: float, head_pitch: float, timestamp: float) -> void:
+	if peer_id == multiplayer.get_unique_id():
+		return
+	add_remote_snapshot(pos, net_velocity, yaw, head_pitch, timestamp)
+
+
 @rpc("any_peer", "unreliable")
 func _server_receive_player_state(pos: Vector3, net_velocity: Vector3, yaw: float, head_pitch: float, _timestamp: float) -> void:
 	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
 		return
 	if _server_state_lock_timer > 0.0:
-		_client_receive_player_state.rpc(_network_peer_id, global_position, velocity, rotation.y, _head.rotation.x if _head != null else 0.0, _network_time())
+		var correction_head_pitch := _head.rotation.x if _head != null else 0.0
+		var world := get_tree().current_scene
+		if world != null and world.has_method("broadcast_player_transform_state"):
+			world.broadcast_player_transform_state(_network_peer_id, global_position, velocity, rotation.y, correction_head_pitch, _network_time())
+		else:
+			_client_receive_player_state.rpc(_network_peer_id, global_position, velocity, rotation.y, correction_head_pitch, _network_time())
 		return
+	_update_server_fall_damage_from_motion(pos, net_velocity)
 	velocity = net_velocity
 	add_remote_snapshot(pos, net_velocity, yaw, head_pitch, _network_time())
-	_client_receive_player_state.rpc(_network_peer_id, pos, net_velocity, yaw, head_pitch, _network_time())
+	var world := get_tree().current_scene
+	if world != null and world.has_method("broadcast_player_transform_state"):
+		world.broadcast_player_transform_state(_network_peer_id, pos, net_velocity, yaw, head_pitch, _network_time())
+	else:
+		_client_receive_player_state.rpc(_network_peer_id, pos, net_velocity, yaw, head_pitch, _network_time())
+
+
+func _update_server_fall_damage_from_motion(pos: Vector3, net_velocity: Vector3) -> void:
+	if _is_dead:
+		_server_has_previous_motion = true
+		_server_previous_pos = pos
+		_server_previous_velocity = net_velocity
+		return
+	if not _server_has_previous_motion:
+		_server_has_previous_motion = true
+		_server_previous_pos = pos
+		_server_previous_velocity = net_velocity
+		_server_fall_peak_y = pos.y
+		return
+
+	var previous_velocity := _server_previous_velocity
+	if net_velocity.y > FALL_LANDING_VELOCITY_EPSILON:
+		_server_fall_peak_y = maxf(_server_fall_peak_y, pos.y)
+		_server_was_falling = false
+	elif net_velocity.y < -FALL_LANDING_VELOCITY_EPSILON:
+		if not _server_was_falling:
+			_server_fall_peak_y = maxf(_server_previous_pos.y, pos.y)
+		else:
+			_server_fall_peak_y = maxf(_server_fall_peak_y, pos.y)
+		_server_was_falling = true
+	elif _server_was_falling and previous_velocity.y < -FALL_LANDING_VELOCITY_EPSILON:
+		var fall_distance := maxf(0.0, _server_fall_peak_y - pos.y)
+		if _apply_fall_damage(fall_distance):
+			_broadcast_combat_state()
+		_server_was_falling = false
+		_server_fall_peak_y = pos.y
+	else:
+		_server_fall_peak_y = maxf(_server_fall_peak_y, pos.y)
+
+	_server_previous_pos = pos
+	_server_previous_velocity = net_velocity
 
 
 @rpc("any_peer", "unreliable")

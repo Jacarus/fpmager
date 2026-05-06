@@ -2,25 +2,63 @@ extends Node3D
 
 const PlayerScene = preload("res://Scenes/Player/Player.tscn")
 const BasicCasterScene = preload("res://Scenes/NPC/BasicCaster.tscn")
+const BossCasterScene = preload("res://Scenes/NPC/BossCaster.tscn")
 const SpellProjectileScene = preload("res://Scenes/SpellProjectile/SpellProjectile.tscn")
 const SpellImpactEffectScript = preload("res://Scripts/SpellImpactEffect.gd")
 const SpellCreationScene = preload("res://Scenes/SpellCreation/SpellCreationUI.tscn")
 const PushTestTargetScript = preload("res://Scenes/World/PushTestTarget.gd")
 const SpellNetworkCodecScript = preload("res://Scripts/SpellNetworkCodec.gd")
 const PLAYER_LOADOUT_CREDIT_LIMIT := 120
+const BEAM_COLLISION_RADIUS_BASE := 0.08
+const BEAM_COLLISION_RADIUS_SIZE_SCALE := 0.045
+const BEAM_COLLISION_IMPACT_INTERVAL := 0.35
+const BEAM_CLASH_MAX_PUSH_FRACTION := 0.72
+const BEAM_CLASH_SMOOTHING := 0.28
+const BASE_PROPERTIES := {
+	"Fire": {"temperature": 10, "density": 2, "opposing": ["Water", "Void"]},
+	"Water": {"temperature": 2, "density": 6, "opposing": ["Fire", "Void"]},
+	"Air": {"temperature": 4, "density": 1, "opposing": ["Earth"]},
+	"Spirit": {"temperature": 5, "density": 0, "opposing": ["Void"]},
+	"Earth": {"temperature": 3, "density": 10, "opposing": ["Air"]},
+	"Light": {"temperature": 6, "density": 0, "opposing": ["Void"]},
+	"Void": {"temperature": 0, "density": -10, "opposing": ["Light", "Spirit", "Fire", "Water"]},
+}
+const PLAYER_COLORS: Array[Color] = [
+	Color(0.2, 0.48, 1.0),
+	Color(1.0, 0.28, 0.22),
+	Color(0.18, 0.85, 0.42),
+	Color(1.0, 0.78, 0.18),
+]
 
 var _player: Node3D
 var _players_root: Node3D
 var _players: Dictionary = {}
+var _player_color_indices: Dictionary = {}
 var _basic_caster: Node3D
 var _basic_casters: Dictionary = {}
+var _bosses: Dictionary = {}
+var _boss_hud_layer: CanvasLayer
+var _boss_hud_panel: VBoxContainer
+var _boss_hud_label: Label
+var _boss_hud_bar: ProgressBar
+var _boss_hud_parts_label: Label
 var _creator_layer: CanvasLayer
 var _peers_in_creator: Dictionary = {}
+var _active_spell_impacts: Array[Dictionary] = []
+var _next_spell_impact_id: int = 1
+var _predicted_projectile_echoes: Array[Dictionary] = []
+var _active_beam_segments: Dictionary = {}
+var _beam_collision_impacts: Dictionary = {}
+var _beam_clash_points: Dictionary = {}
+var _world_state_retry_timer: float = 0.0
+var _world_state_request_cooldown: float = 0.0
 
 
 func _ready() -> void:
 	if not GameSettings.bot_settings_changed.is_connected(_on_bot_settings_changed):
 		GameSettings.bot_settings_changed.connect(_on_bot_settings_changed)
+	if not GameSettings.boss_settings_changed.is_connected(_on_boss_settings_changed):
+		GameSettings.boss_settings_changed.connect(_on_boss_settings_changed)
 	_build_environment()
 	_build_level()
 	_players_root = Node3D.new()
@@ -31,22 +69,80 @@ func _ready() -> void:
 	else:
 		_spawn_single_player()
 		_spawn_configured_bots()
+		_spawn_configured_boss()
 	_spawn_push_test_target()
+	if _is_dedicated_server():
+		DedicatedServer.notify_world_ready()
+
+
+func _process(_delta: float) -> void:
+	var is_connected := false
+	if multiplayer.multiplayer_peer != null:
+		var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+		is_connected = peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED
+	
+	if is_connected and multiplayer.is_server():
+		_prune_expired_spell_impacts()
+	else:
+		_prune_predicted_projectile_echoes()
+		if _world_state_request_cooldown > 0.0:
+			_world_state_request_cooldown -= _delta
+		_retry_world_state_request(_delta)
+	_prune_invalid_bosses()
+	_prune_stale_beam_segments()
 
 
 func _setup_multiplayer_world() -> void:
-	if multiplayer.is_server():
+	var is_server := false
+	if multiplayer.multiplayer_peer != null:
+		var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+		is_server = peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED and multiplayer.is_server()
+	
+	if is_server:
 		if not multiplayer.peer_disconnected.is_connected(_on_peer_disconnected):
 			multiplayer.peer_disconnected.connect(_on_peer_disconnected)
 		if not _is_dedicated_server():
-			_spawn_player_for_peer(1, Vector3(0, 1.0, 8))
+			_spawn_player_for_peer(1, Vector3(0, 1.0, 8), _assign_player_color(1))
 		_spawn_configured_bots()
+		_spawn_configured_boss()
 	else:
-		_request_world_state.rpc_id(1)
+		_request_world_state_from_server()
 
 
 func _is_dedicated_server() -> bool:
 	return DedicatedServer.is_active()
+
+
+func _request_world_state_from_server() -> void:
+	if multiplayer.multiplayer_peer == null:
+		return
+	var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+	if peer == null or peer.get_connection_status() != MultiplayerPeer.CONNECTION_CONNECTED:
+		return
+	var local_unique_id := multiplayer.get_unique_id()
+	if local_unique_id == 0:
+		return
+	_world_state_request_cooldown = 1.0
+	_world_state_retry_timer = 1.0
+	_request_world_state.rpc_id(1, local_unique_id)
+
+
+func _retry_world_state_request(delta: float) -> void:
+	if multiplayer.multiplayer_peer == null:
+		return
+	var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+	if peer == null or peer.get_connection_status() != MultiplayerPeer.CONNECTION_CONNECTED:
+		return
+	if multiplayer.is_server():
+		return
+	if _player != null:
+		return
+	if _creator_layer != null:
+		return
+	_world_state_retry_timer -= delta
+	if _world_state_retry_timer > 0.0:
+		return
+	_request_world_state_from_server()
 
 
 func _build_environment() -> void:
@@ -119,51 +215,88 @@ func _add_box(pos: Vector3, size: Vector3, color: Color) -> void:
 func _spawn_single_player() -> void:
 	var player := PlayerScene.instantiate()
 	player.position = Vector3(0, 1.0, 8)
+	if player.has_method("set_player_color"):
+		player.set_player_color(PLAYER_COLORS[0])
 	_players_root.add_child(player)
 	_player = player
 
 
 @rpc("any_peer", "reliable")
-func _request_world_state() -> void:
+func _request_world_state(requested_peer_id: int = 0) -> void:
 	if not multiplayer.is_server():
 		return
 	var peer_id := multiplayer.get_remote_sender_id()
+	if peer_id <= 0 and requested_peer_id > 1:
+		peer_id = requested_peer_id
+	if peer_id <= 1:
+		print("[World] Ignoring world-state request with invalid peer id: ", peer_id)
+		return
+	print("[World] World-state request from peer ", peer_id)
+	if not _players.has(peer_id) and not _peers_in_creator.has(peer_id):
+		var spawn_position := _get_spawn_position(_players.size())
+		var player_color := _assign_player_color(peer_id)
+		_spawn_player_for_peer(peer_id, spawn_position, player_color)
+		_spawn_player_for_peer.rpc_id(peer_id, peer_id, spawn_position, player_color)
+		for connected_peer_id in multiplayer.get_peers():
+			if int(connected_peer_id) != peer_id:
+				_spawn_player_for_peer.rpc_id(int(connected_peer_id), peer_id, spawn_position, player_color)
 	for existing_peer_id in _players.keys():
 		var player := _players[existing_peer_id] as Node3D
 		if player != null:
-			_spawn_player_for_peer.rpc_id(peer_id, int(existing_peer_id), player.global_position)
+			_spawn_player_for_peer.rpc_id(peer_id, int(existing_peer_id), player.global_position, _get_player_color(int(existing_peer_id)))
+	print("[World] Sending %d bots to peer %d" % [_basic_casters.size(), peer_id])
 	for bot_id in _basic_casters.keys():
 		var caster := _basic_casters[bot_id] as Node3D
 		if caster != null:
-			_spawn_basic_caster_for_all.rpc_id(
+			print("[World] Calling _spawn_basic_caster_for_peer for bot %d to peer %d" % [int(bot_id), peer_id])
+			_spawn_basic_caster_for_peer.rpc_id(
 				peer_id,
 				int(bot_id),
 				caster.global_position,
 				caster.get_spell_loadout_data() if caster.has_method("get_spell_loadout_data") else [],
 				caster.get_difficulty_data() if caster.has_method("get_difficulty_data") else _get_bot_difficulty_data()
 			)
-	if not _players.has(peer_id):
-		var spawn_position := _get_spawn_position(_players.size())
-		_spawn_player_for_peer.rpc(peer_id, spawn_position)
+	for boss_id in _bosses.keys():
+		var boss := _bosses[boss_id] as Node3D
+		if boss != null:
+			var settings: Dictionary = boss.get_settings_data() if boss.has_method("get_settings_data") else {}
+			_spawn_boss_for_peer.rpc_id(peer_id, int(boss_id), boss.global_position, settings)
+			if boss.has_method("send_full_state_to_peer"):
+				boss.send_full_state_to_peer(peer_id)
+	_send_active_spell_impacts(peer_id)
 
 
-@rpc("authority", "call_local", "reliable")
-func _spawn_player_for_peer(peer_id: int, spawn_position: Vector3) -> void:
+@rpc("any_peer", "reliable")
+func _spawn_player_for_peer(peer_id: int, spawn_position: Vector3, player_color: Color = Color(0.18, 0.14, 0.24)) -> void:
+	if multiplayer.get_remote_sender_id() != 1:
+		return
 	if _players.has(peer_id):
 		return
+	var local_unique_id := 0
+	if multiplayer.multiplayer_peer != null:
+		var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+		if peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED:
+			local_unique_id = multiplayer.get_unique_id()
+	print("[World] Spawning player ", peer_id, " local_unique=", local_unique_id)
 	var player := PlayerScene.instantiate()
 	player.name = "Player_%d" % peer_id
 	if player.has_method("setup_multiplayer"):
-		player.setup_multiplayer(peer_id, peer_id == multiplayer.get_unique_id())
+		player.setup_multiplayer(peer_id, peer_id == local_unique_id)
+	if player.has_method("set_player_color"):
+		player.set_player_color(player_color)
 	player.position = spawn_position
 	_players_root.add_child(player)
 	_players[peer_id] = player
-	if _player == null or peer_id == multiplayer.get_unique_id():
+	# Only set _player if multiplayer is active
+	if _player == null or (local_unique_id != 0 and peer_id == local_unique_id):
 		_player = player
 	_refresh_basic_caster_target()
+	_refresh_boss_targets()
 
 
 func _on_peer_disconnected(peer_id: int) -> void:
+	_player_color_indices.erase(peer_id)
+	_peers_in_creator.erase(peer_id)
 	_despawn_player_for_peer.rpc(peer_id)
 
 
@@ -171,11 +304,44 @@ func _on_peer_disconnected(peer_id: int) -> void:
 func _despawn_player_for_peer(peer_id: int) -> void:
 	var player := _players.get(peer_id) as Node
 	if player != null:
+		# Stop any active beam before despawning to prevent RPC errors
+		# Don't broadcast RPCs since the player is being removed
+		if player.has_method("stop_beam"):
+			player.stop_beam(false)
 		player.queue_free()
-	_players.erase(peer_id)
-	if _player == player:
-		_player = null
-	_refresh_basic_caster_target()
+		unregister_beam_segment("player:%d" % peer_id)
+		_players.erase(peer_id)
+		if _player == player:
+			_player = null
+		_refresh_basic_caster_target()
+		_refresh_boss_targets()
+
+
+func _assign_player_color(peer_id: int) -> Color:
+	if _player_color_indices.has(peer_id):
+		return PLAYER_COLORS[int(_player_color_indices[peer_id])]
+	var used := {}
+	for value in _player_color_indices.values():
+		used[int(value)] = true
+	for i in range(PLAYER_COLORS.size()):
+		if not used.has(i):
+			_player_color_indices[peer_id] = i
+			return PLAYER_COLORS[i]
+	var fallback_index: int = abs(peer_id) % PLAYER_COLORS.size()
+	_player_color_indices[peer_id] = fallback_index
+	return PLAYER_COLORS[fallback_index]
+
+
+func _get_player_color(peer_id: int) -> Color:
+	var is_server := false
+	if multiplayer.multiplayer_peer != null:
+		var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+		is_server = peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED and multiplayer.is_server()
+	
+	if is_server:
+		return _assign_player_color(peer_id)
+	var index := int(_player_color_indices.get(peer_id, 0))
+	return PLAYER_COLORS[clampi(index, 0, PLAYER_COLORS.size() - 1)]
 
 
 func _get_spawn_position(index: int) -> Vector3:
@@ -196,14 +362,37 @@ func _on_bot_settings_changed() -> void:
 	_reconcile_configured_bots()
 
 
+func force_reconcile_bots() -> void:
+	_reconcile_configured_bots()
+
+
+func _spawn_configured_boss() -> void:
+	_reconcile_configured_boss()
+
+
+func _on_boss_settings_changed() -> void:
+	_reconcile_configured_boss()
+
+
 func _can_manage_bots() -> bool:
-	return multiplayer.multiplayer_peer == null or multiplayer.is_server()
+	if multiplayer.multiplayer_peer == null:
+		return true
+	var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+	return peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED and multiplayer.is_server()
+
+
+func _can_manage_bosses() -> bool:
+	if multiplayer.multiplayer_peer == null:
+		return true
+	var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+	return peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED and multiplayer.is_server()
 
 
 func _reconcile_configured_bots() -> void:
 	if not _can_manage_bots():
 		return
 	var desired_count := GameSettings.bot_count if GameSettings.bots_enabled else 0
+	print("[World] _reconcile_configured_bots: desired=%d current=%d bots_enabled=%s" % [desired_count, _basic_casters.size(), str(GameSettings.bots_enabled)])
 	for bot_id in _basic_casters.keys():
 		if int(bot_id) >= desired_count:
 			_despawn_basic_caster(bot_id)
@@ -213,6 +402,7 @@ func _reconcile_configured_bots() -> void:
 		var pos := _get_bot_spawn_position(i)
 		var loadout := _create_random_bot_loadout()
 		var difficulty_data := _get_bot_difficulty_data()
+		print("[World] Spawning bot %d at %s" % [i, str(pos)])
 		if multiplayer.multiplayer_peer != null and multiplayer.is_server():
 			_spawn_basic_caster_for_all.rpc(i, pos, loadout, difficulty_data)
 		else:
@@ -242,6 +432,14 @@ func _spawn_basic_caster_for_all(bot_id: int, spawn_position: Vector3, loadout_d
 	_spawn_basic_caster_local(bot_id, spawn_position, loadout_data, difficulty_data)
 
 
+@rpc("any_peer", "reliable")
+func _spawn_basic_caster_for_peer(bot_id: int, spawn_position: Vector3, loadout_data: Array, difficulty_data: Dictionary) -> void:
+	if multiplayer.get_remote_sender_id() != 1:
+		return
+	print("[World] _spawn_basic_caster_for_peer called: bot_id=%d, position=%s" % [bot_id, str(spawn_position)])
+	_spawn_basic_caster_local(bot_id, spawn_position, loadout_data, difficulty_data)
+
+
 func _spawn_basic_caster_local(bot_id: int, spawn_position: Vector3, loadout_data: Array, difficulty_data: Dictionary) -> void:
 	if _basic_casters.has(bot_id):
 		return
@@ -252,9 +450,12 @@ func _spawn_basic_caster_local(bot_id: int, spawn_position: Vector3, loadout_dat
 		caster.set_spell_loadout_data(loadout_data)
 	if caster.has_method("set_difficulty_data"):
 		caster.set_difficulty_data(difficulty_data)
-	caster.target = _player
+	# Only set target if player is available; otherwise refresh_basic_caster_target will handle it
+	if _player != null:
+		caster.target = _player
 	add_child(caster)
 	_basic_casters[bot_id] = caster
+	print("[World] Bot %d spawned locally, total bots: %d" % [bot_id, _basic_casters.size()])
 	if _basic_caster == null:
 		_basic_caster = caster
 	_refresh_basic_caster_target()
@@ -291,10 +492,8 @@ func _update_existing_bot_difficulty() -> void:
 		_update_basic_caster_difficulty_local(difficulty_data)
 
 
-@rpc("any_peer", "call_local", "reliable")
+@rpc("authority", "call_local", "reliable")
 func _update_basic_caster_difficulty_for_all(difficulty_data: Dictionary) -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
-		return
 	_update_basic_caster_difficulty_local(difficulty_data)
 
 
@@ -302,6 +501,262 @@ func _update_basic_caster_difficulty_local(difficulty_data: Dictionary) -> void:
 	for caster in _basic_casters.values():
 		if caster != null and caster.has_method("set_difficulty_data"):
 			caster.set_difficulty_data(difficulty_data)
+
+
+func broadcast_basic_caster_state(
+	bot_id: int,
+	pos: Vector3,
+	yaw: float,
+	health: int,
+	is_dead: bool,
+	blind_timer: float,
+	timestamp: float
+) -> void:
+	if multiplayer.multiplayer_peer == null or not multiplayer.is_server():
+		return
+	_client_receive_basic_caster_state.rpc(bot_id, pos, yaw, health, is_dead, blind_timer, timestamp)
+
+
+@rpc("authority", "unreliable")
+func _client_receive_basic_caster_state(
+	bot_id: int,
+	pos: Vector3,
+	yaw: float,
+	health: int,
+	is_dead: bool,
+	blind_timer: float,
+	timestamp: float
+) -> void:
+	if multiplayer.is_server():
+		return
+	var caster := _basic_casters.get(bot_id) as Node
+	if caster == null:
+		if _player == null:
+			_request_world_state_from_server()
+		return
+	if caster.has_method("_client_receive_state"):
+		caster._client_receive_state(pos, yaw, health, is_dead, blind_timer, timestamp)
+
+
+func _reconcile_configured_boss() -> void:
+	if not _can_manage_bosses():
+		return
+	if GameSettings.boss_enabled:
+		if _bosses.has(0):
+			return
+		spawn_boss(GameSettings.get_boss_spawn_settings())
+	elif _bosses.has(0):
+		despawn_boss(0)
+
+
+func spawn_boss(settings: Dictionary = {}) -> bool:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server():
+		return false
+	var boss_id := int(settings.get("boss_id", _get_next_boss_id()))
+	var replace_existing := bool(settings.get("replace_existing", false))
+	if _bosses.has(boss_id):
+		var existing := _bosses.get(boss_id) as Node
+		var existing_dead := false
+		if existing != null and existing.has_method("get_state_data"):
+			var state := existing.get_state_data() as Dictionary
+			existing_dead = bool(state.get("is_dead", false))
+		if not existing_dead and not replace_existing:
+			return false
+		despawn_boss(boss_id)
+	var spawn_position := settings.get("spawn_position", Vector3(0, 0.0, -14)) as Vector3
+	var boss_settings := settings.duplicate(true)
+	boss_settings.erase("replace_existing")
+	boss_settings["boss_id"] = boss_id
+	boss_settings["spawn_position"] = spawn_position
+	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
+		_spawn_boss_for_all.rpc(boss_id, spawn_position, boss_settings)
+	else:
+		_spawn_boss_local(boss_id, spawn_position, boss_settings)
+	return true
+
+
+func despawn_boss(boss_id: int = 0) -> bool:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server():
+		return false
+	if not _bosses.has(boss_id):
+		return false
+	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
+		_despawn_boss_for_all.rpc(boss_id)
+	else:
+		_despawn_boss_local(boss_id)
+	return true
+
+
+func get_boss_count() -> int:
+	return _bosses.size()
+
+
+@rpc("any_peer", "call_local", "reliable")
+func _spawn_boss_for_all(boss_id: int, spawn_position: Vector3, settings: Dictionary) -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+		return
+	_spawn_boss_local(boss_id, spawn_position, settings)
+
+
+@rpc("any_peer", "reliable")
+func _spawn_boss_for_peer(boss_id: int, spawn_position: Vector3, settings: Dictionary) -> void:
+	if multiplayer.get_remote_sender_id() != 1:
+		return
+	_spawn_boss_local(boss_id, spawn_position, settings)
+
+
+func _spawn_boss_local(boss_id: int, spawn_position: Vector3, settings: Dictionary) -> void:
+	if _bosses.has(boss_id):
+		return
+	var boss := BossCasterScene.instantiate()
+	boss.name = "BossCaster_%d" % boss_id
+	var boss_settings := settings.duplicate(true)
+	boss_settings["boss_id"] = boss_id
+	boss_settings["spawn_position"] = spawn_position
+	if boss.has_method("configure"):
+		boss.configure(boss_settings)
+	boss.position = spawn_position
+	if boss.has_method("get_boss_id"):
+		boss_id = int(boss.get_boss_id())
+	add_child(boss)
+	_bosses[boss_id] = boss
+	_refresh_boss_targets()
+	if boss.has_method("get_state_data"):
+		update_boss_health_hud(boss.get_state_data())
+
+
+@rpc("any_peer", "call_local", "reliable")
+func _despawn_boss_for_all(boss_id: int) -> void:
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+		return
+	_despawn_boss_local(boss_id)
+
+
+func _despawn_boss_local(boss_id: int) -> void:
+	var boss := _bosses.get(boss_id) as Node
+	if boss != null:
+		boss.queue_free()
+	_bosses.erase(boss_id)
+	_remove_boss_health_hud_if_empty()
+
+
+func _get_next_boss_id() -> int:
+	var next_id := 0
+	while _bosses.has(next_id):
+		next_id += 1
+	return next_id
+
+
+func _refresh_boss_targets() -> void:
+	var players := get_active_player_nodes()
+	var target_player: Node3D = null
+	if not players.is_empty():
+		target_player = players[0] as Node3D
+	for boss in _bosses.values():
+		if boss != null:
+			boss.target = target_player
+
+
+func get_active_player_nodes() -> Array:
+	var results: Array = []
+	for player in _players.values():
+		if player is Node3D and is_instance_valid(player):
+			results.append(player)
+	if results.is_empty() and _player != null and is_instance_valid(_player):
+		results.append(_player)
+	return results
+
+
+func spawn_authoritative_spell_impact(spell: SpellDefinition, position: Vector3, normal: Vector3, source: Node = null) -> void:
+	if spell == null:
+		return
+	if multiplayer.multiplayer_peer != null and not multiplayer.is_server():
+		return
+	var effect := SpellImpactEffectScript.new()
+	get_tree().current_scene.add_child(effect)
+	effect.initialize(spell, position, normal, source)
+	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
+		broadcast_spell_impact(spell, position, normal)
+
+
+func update_boss_health_hud(state: Dictionary) -> void:
+	if _is_dedicated_server():
+		return
+	_ensure_boss_health_hud()
+	var max_health: int = max(1, int(state.get("max_health", 1)))
+	var health: int = clampi(int(state.get("health", 0)), 0, max_health)
+	_boss_hud_label.text = "%s  %d / %d" % [str(state.get("display_name", "Boss")), health, max_health]
+	_boss_hud_bar.max_value = max_health
+	_boss_hud_bar.value = health
+	_boss_hud_panel.visible = not bool(state.get("is_dead", false)) or health > 0
+	var part_texts: Array[String] = []
+	for part in state.get("parts", []):
+		var data := part as Dictionary
+		var name := str(data.get("name", data.get("id", "Part")))
+		if bool(data.get("destroyed", false)):
+			part_texts.append("%s: destroyed" % name)
+		else:
+			part_texts.append("%s: %d/%d" % [name, int(data.get("health", 0)), int(data.get("max_health", 1))])
+	_boss_hud_parts_label.text = "   ".join(part_texts)
+
+
+func _ensure_boss_health_hud() -> void:
+	if _boss_hud_layer != null:
+		return
+	_boss_hud_layer = CanvasLayer.new()
+	_boss_hud_layer.name = "BossHud"
+	add_child(_boss_hud_layer)
+
+	_boss_hud_panel = VBoxContainer.new()
+	_boss_hud_layer.add_child(_boss_hud_panel)
+	_boss_hud_panel.set_anchors_and_offsets_preset(Control.PRESET_TOP_WIDE)
+	_boss_hud_panel.offset_left = 320.0
+	_boss_hud_panel.offset_top = 18.0
+	_boss_hud_panel.offset_right = -320.0
+	_boss_hud_panel.offset_bottom = 84.0
+	_boss_hud_panel.add_theme_constant_override("separation", 4)
+
+	_boss_hud_label = Label.new()
+	_boss_hud_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_boss_hud_label.add_theme_font_size_override("font_size", 18)
+	_boss_hud_label.add_theme_color_override("font_color", Color(1.0, 0.82, 0.42))
+	_boss_hud_panel.add_child(_boss_hud_label)
+
+	_boss_hud_bar = ProgressBar.new()
+	_boss_hud_bar.min_value = 0.0
+	_boss_hud_bar.max_value = 1.0
+	_boss_hud_bar.show_percentage = false
+	_boss_hud_bar.custom_minimum_size = Vector2(520, 14)
+	_boss_hud_panel.add_child(_boss_hud_bar)
+
+	_boss_hud_parts_label = Label.new()
+	_boss_hud_parts_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_boss_hud_parts_label.add_theme_font_size_override("font_size", 12)
+	_boss_hud_parts_label.add_theme_color_override("font_color", Color(0.95, 0.85, 0.68, 0.88))
+	_boss_hud_panel.add_child(_boss_hud_parts_label)
+
+
+func _remove_boss_health_hud_if_empty() -> void:
+	if not _bosses.is_empty():
+		return
+	if _boss_hud_layer != null:
+		_boss_hud_layer.queue_free()
+	_boss_hud_layer = null
+	_boss_hud_panel = null
+	_boss_hud_label = null
+	_boss_hud_bar = null
+	_boss_hud_parts_label = null
+
+
+func _prune_invalid_bosses() -> void:
+	var removed := false
+	for boss_id in _bosses.keys():
+		var boss := _bosses[boss_id] as Node
+		if boss == null or not is_instance_valid(boss) or boss.is_queued_for_deletion():
+			_bosses.erase(boss_id)
+			removed = true
+	if removed:
+		_remove_boss_health_hud_if_empty()
 
 
 func open_spell_creator_for_local_player() -> void:
@@ -315,7 +770,6 @@ func open_spell_creator_for_local_player() -> void:
 			_server_set_peer_in_creator.rpc_id(1, true)
 			_show_spell_creator_overlay()
 	else:
-		_despawn_player_for_peer(peer_id)
 		_show_spell_creator_overlay()
 
 
@@ -327,8 +781,6 @@ func close_spell_creator_for_local_player() -> void:
 			_set_peer_in_creator(peer_id, false)
 		else:
 			_server_set_peer_in_creator.rpc_id(1, false)
-	else:
-		_spawn_player_for_peer(peer_id, _get_spawn_position(_players.size()))
 
 
 @rpc("any_peer", "reliable")
@@ -343,14 +795,18 @@ func _set_peer_in_creator(peer_id: int, in_creator: bool) -> void:
 		if _peers_in_creator.has(peer_id):
 			return
 		_peers_in_creator[peer_id] = true
-		_despawn_player_for_peer.rpc(peer_id)
+		# Don't despawn the player - keep the node alive for RPC calls
+		# Just mark them as in creator so they don't participate in gameplay
 		if peer_id == multiplayer.get_unique_id():
 			_show_spell_creator_overlay()
 	else:
 		if not _peers_in_creator.has(peer_id):
 			return
 		_peers_in_creator.erase(peer_id)
-		_spawn_player_for_peer.rpc(peer_id, _get_spawn_position(_players.size()))
+		# Player already exists, no need to respawn
+		# Just close the overlay if we're the local player
+		if peer_id == multiplayer.get_unique_id():
+			_close_spell_creator_overlay()
 
 
 func _show_spell_creator_overlay() -> void:
@@ -371,8 +827,6 @@ func _close_spell_creator_overlay() -> void:
 
 
 func _refresh_basic_caster_target() -> void:
-	if _basic_caster == null:
-		return
 	var best_player: Node3D = null
 	for player in _players.values():
 		if player is Node3D:
@@ -459,6 +913,7 @@ func _make_bot_spell_data(spell_name: String, weights: Dictionary, shape: String
 		"spell_size": size,
 		"spell_range": spell_range,
 		"spell_speed": speed,
+		"wall_time": 4,
 		"has_charging": false,
 		"burns": false,
 		"cools": false,
@@ -502,7 +957,7 @@ func broadcast_player_combat_state(
 	)
 
 
-@rpc("any_peer", "call_local", "reliable")
+@rpc("authority", "call_local", "reliable")
 func _client_receive_player_combat_state(
 	peer_id: int,
 	health: int,
@@ -514,11 +969,28 @@ func _client_receive_player_combat_state(
 	pos: Vector3,
 	external_velocity: Vector3
 ) -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
-		return
 	var player := _players.get(peer_id) as Node
 	if player != null and player.has_method("apply_network_combat_state"):
 		player.apply_network_combat_state(health, mana, is_dead, respawn_timer, blind_timer, blind_duration, pos, external_velocity)
+
+
+func broadcast_player_transform_state(peer_id: int, pos: Vector3, net_velocity: Vector3, yaw: float, head_pitch: float, timestamp: float) -> void:
+	if multiplayer.multiplayer_peer == null or not multiplayer.is_server():
+		return
+	_client_receive_player_transform_state.rpc(peer_id, pos, net_velocity, yaw, head_pitch, timestamp)
+
+
+@rpc("authority", "unreliable")
+func _client_receive_player_transform_state(peer_id: int, pos: Vector3, net_velocity: Vector3, yaw: float, head_pitch: float, timestamp: float) -> void:
+	if multiplayer.is_server():
+		return
+	var player := _players.get(peer_id) as Node
+	if player == null:
+		if _player == null:
+			_request_world_state_from_server()
+		return
+	if player.has_method("apply_network_transform_state"):
+		player.apply_network_transform_state(peer_id, pos, net_velocity, yaw, head_pitch, timestamp)
 
 
 func spawn_network_projectile(spell: SpellDefinition, from: Vector3, direction: Vector3, source: Node, cast_server_time: float = -1.0) -> void:
@@ -535,16 +1007,27 @@ func spawn_network_projectile(spell: SpellDefinition, from: Vector3, direction: 
 	_client_spawn_network_projectile.rpc(SpellNetworkCodecScript.to_dict(spell), from, direction, source_peer_id)
 
 
-@rpc("any_peer", "reliable")
-func _client_spawn_network_projectile(spell_data: Dictionary, from: Vector3, direction: Vector3, source_peer_id: int) -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
+func remember_predicted_projectile(spell: SpellDefinition, from: Vector3, direction: Vector3) -> void:
+	if multiplayer.multiplayer_peer == null or multiplayer.is_server():
 		return
+	_predicted_projectile_echoes.append({
+		"spell_key": _get_projectile_prediction_spell_key(spell),
+		"from": from,
+		"direction": direction.normalized(),
+		"created_at": Time.get_ticks_msec() / 1000.0,
+	})
+	_prune_predicted_projectile_echoes()
+
+
+@rpc("authority", "reliable")
+func _client_spawn_network_projectile(spell_data: Dictionary, from: Vector3, direction: Vector3, source_peer_id: int) -> void:
 	if multiplayer.is_server():
 		return
-	if source_peer_id == multiplayer.get_unique_id():
+	var spell := SpellNetworkCodecScript.from_dict(spell_data)
+	if source_peer_id == multiplayer.get_unique_id() or _consume_predicted_projectile_echo(spell, from, direction):
 		return
 	var source := _players.get(source_peer_id) as Node
-	_spawn_projectile_local(SpellNetworkCodecScript.from_dict(spell_data), from, direction, source)
+	_spawn_projectile_local(spell, from, direction, source)
 
 
 func _spawn_projectile_local(spell: SpellDefinition, from: Vector3, direction: Vector3, source: Node, cast_server_time: float = -1.0) -> void:
@@ -553,27 +1036,504 @@ func _spawn_projectile_local(spell: SpellDefinition, from: Vector3, direction: V
 	projectile.initialize(spell, from, direction, source, cast_server_time)
 
 
+func _consume_predicted_projectile_echo(spell: SpellDefinition, from: Vector3, direction: Vector3) -> bool:
+	_prune_predicted_projectile_echoes()
+	var spell_key := _get_projectile_prediction_spell_key(spell)
+	var normalized_direction := direction.normalized()
+	for i in range(_predicted_projectile_echoes.size() - 1, -1, -1):
+		var prediction := _predicted_projectile_echoes[i]
+		var predicted_direction := prediction["direction"] as Vector3
+		if str(prediction["spell_key"]) != spell_key:
+			continue
+		if (prediction["from"] as Vector3).distance_to(from) > 1.2:
+			continue
+		if predicted_direction.dot(normalized_direction) < 0.985:
+			continue
+		_predicted_projectile_echoes.remove_at(i)
+		return true
+	return false
+
+
+func _prune_predicted_projectile_echoes() -> void:
+	var now := Time.get_ticks_msec() / 1000.0
+	for i in range(_predicted_projectile_echoes.size() - 1, -1, -1):
+		if now - float(_predicted_projectile_echoes[i]["created_at"]) > 1.5:
+			_predicted_projectile_echoes.remove_at(i)
+
+
+func _get_projectile_prediction_spell_key(spell: SpellDefinition) -> String:
+	if spell == null:
+		return ""
+	return "%s|%s|%s|%d|%d|%d|%d" % [
+		spell.spell_name,
+		spell.get_blend_key(),
+		spell.shape,
+		spell.intensity,
+		spell.spell_size,
+		spell.spell_range,
+		spell.spell_speed,
+	]
+
+
+func resolve_beam_segment(source_key: String, spell: SpellDefinition, origin: Vector3, raw_target: Vector3, source: Node = null) -> Dictionary:
+	if spell == null:
+		return {"target": raw_target, "blocked": false}
+	var now := Time.get_ticks_msec() / 1000.0
+	var segment := {
+		"source_key": source_key,
+		"spell": spell,
+		"origin": origin,
+		"raw_target": raw_target,
+		"target": raw_target,
+		"source": source,
+		"updated_at": now,
+	}
+	_active_beam_segments[source_key] = segment
+
+	var best_t := 2.0
+	var clipped_target := raw_target
+	var blocked := false
+	var direction := (raw_target - origin).normalized()
+	var beam_radius := _get_beam_collision_radius(spell)
+	var beam_length := maxf(origin.distance_to(raw_target), 0.001)
+	for node in get_tree().get_nodes_in_group("spell_projectile"):
+		if node == null or not is_instance_valid(node):
+			continue
+		if not node.has_method("is_spell_wall") or not bool(node.is_spell_wall()):
+			continue
+		if node.has_method("is_spell_consumed") and bool(node.is_spell_consumed()):
+			continue
+		var wall_hit: Dictionary = node.get_wall_segment_hit(origin, raw_target, beam_radius)
+		if wall_hit.is_empty():
+			continue
+		var hit_position := wall_hit["position"] as Vector3
+		var t_wall := origin.distance_to(hit_position) / beam_length
+		if t_wall >= best_t:
+			continue
+		best_t = t_wall
+		clipped_target = hit_position
+		blocked = true
+		var outcome: Dictionary = node.apply_wall_block(spell, true, source_key, BEAM_COLLISION_IMPACT_INTERVAL)
+		var reaction_spell := outcome.get("reaction_spell") as SpellDefinition
+		if reaction_spell == null:
+			reaction_spell = spell
+		_maybe_spawn_beam_wall_impact(source_key, node, reaction_spell, hit_position, -direction)
+	for other_key in _active_beam_segments.keys():
+		var other_source_key := str(other_key)
+		if other_source_key == source_key:
+			continue
+		var other := _active_beam_segments[other_key] as Dictionary
+		if other.is_empty() or now - float(other.get("updated_at", 0.0)) > 0.25:
+			continue
+		var other_spell := other.get("spell") as SpellDefinition
+		if other_spell == null:
+			continue
+		var other_origin := other["origin"] as Vector3
+		var other_raw_target := other["raw_target"] as Vector3
+		var closest := _get_closest_segment_points(origin, raw_target, other_origin, other_raw_target)
+		var collision_radius := _get_beam_collision_radius(spell) + _get_beam_collision_radius(other_spell)
+		if float(closest["distance"]) > collision_radius:
+			continue
+
+		var t_self := float(closest["t_a"])
+		var t_other := float(closest["t_b"])
+		var collision_point: Vector3 = (closest["point_a"] as Vector3).lerp(closest["point_b"] as Vector3, 0.5)
+		var other_direction := (other_raw_target - other_origin).normalized()
+		var outcome := _resolve_beam_collision(spell, other_spell, direction, other_direction)
+		var pair_key := _get_beam_pair_key(source_key, other_source_key)
+		var clash_point := _get_pushed_beam_clash_point(
+			pair_key,
+			collision_point,
+			origin,
+			raw_target,
+			t_self,
+			other_origin,
+			other_raw_target,
+			t_other,
+			float(outcome.get("clash_bias", 0.0))
+		)
+		var impact_spell := outcome.get("reaction_spell") as SpellDefinition
+		if impact_spell == null:
+			impact_spell = spell
+		_maybe_spawn_beam_collision_impact(source_key, other_source_key, impact_spell, clash_point, -direction)
+
+		if bool(outcome.get("block_b", false)):
+			var other_target := clash_point
+			if other_origin.distance_to(other_target) < other_origin.distance_to(other.get("target", other_raw_target)):
+				other["target"] = other_target
+				other["blocked"] = true
+				_active_beam_segments[other_key] = other
+		if bool(outcome.get("block_a", false)) and t_self < best_t:
+			best_t = t_self
+			clipped_target = clash_point
+			blocked = true
+
+	segment["target"] = clipped_target
+	segment["blocked"] = blocked
+	_active_beam_segments[source_key] = segment
+	return {"target": clipped_target, "blocked": blocked}
+
+
+func get_registered_beam_target(source_key: String, fallback: Vector3) -> Vector3:
+	var segment := _active_beam_segments.get(source_key, {}) as Dictionary
+	if segment.is_empty():
+		return fallback
+	if not bool(segment.get("blocked", false)):
+		return fallback
+	return segment.get("target", fallback) as Vector3
+
+
+func unregister_beam_segment(source_key: String) -> void:
+	_active_beam_segments.erase(source_key)
+
+
+func _resolve_beam_collision(a: SpellDefinition, b: SpellDefinition, direction_a: Vector3, direction_b: Vector3) -> Dictionary:
+	var opposing_pair := _find_opposing_pair(a, b)
+	if not opposing_pair.is_empty():
+		var power_a := _get_opposition_power(a, opposing_pair[0])
+		var power_b := _get_opposition_power(b, opposing_pair[1])
+		var high_power: float = maxf(power_a, power_b)
+		if _is_steam_reaction(opposing_pair):
+			return {
+				"block_a": true,
+				"block_b": true,
+				"clash_bias": _get_power_bias(power_a, power_b),
+				"reaction_spell": _create_reaction_spell(a, b, opposing_pair, 1.75),
+			}
+		var interference := _get_wave_interference(a, b, direction_a, direction_b)
+		var cancel_strength := _get_cancel_strength(interference)
+		var effective_a := power_a * (0.65 + cancel_strength * 0.7)
+		var effective_b := power_b * (0.65 + cancel_strength * 0.7)
+		var reaction_spell := _create_reaction_spell(a, b, opposing_pair)
+		if high_power <= 0.0:
+			return {"block_a": true, "block_b": true, "reaction_spell": reaction_spell}
+		return {
+			"block_a": true,
+			"block_b": true,
+			"clash_bias": _get_power_bias(effective_a, effective_b),
+			"reaction_spell": reaction_spell,
+		}
+
+	if a.get_dominant_base() == b.get_dominant_base():
+		var total_a := _get_total_power(a)
+		var total_b := _get_total_power(b)
+		var interference := _get_wave_interference(a, b, direction_a, direction_b)
+		var high_power: float = maxf(total_a, total_b)
+		if interference >= 0.35:
+			return {"block_a": false, "block_b": false}
+		if high_power <= 0.0 or interference <= -0.35 and absf(total_a - total_b) / high_power <= 0.25:
+			return {"block_a": true, "block_b": true}
+		if interference <= -0.35:
+			return {"block_a": true, "block_b": true, "clash_bias": _get_power_bias(total_a, total_b)}
+		return {"block_a": true, "block_b": true, "clash_bias": _get_power_bias(total_a, total_b) * 0.45}
+
+	var density_a := _get_spell_density(a)
+	var density_b := _get_spell_density(b)
+	var density_delta := absf(density_a - density_b)
+	if density_delta > 6.0:
+		return {"block_a": true, "block_b": true, "clash_bias": _get_power_bias(density_a, density_b)}
+	var temp_delta := absf(_get_spell_temperature(a) - _get_spell_temperature(b))
+	var interference := _get_wave_interference(a, b, direction_a, direction_b)
+	if temp_delta > 6.0:
+		return {"block_a": true, "block_b": true, "clash_bias": _get_power_bias(_get_total_power(a), _get_total_power(b)) * 0.65}
+	if interference > 0.55:
+		return {"block_a": false, "block_b": false}
+	return {"block_a": true, "block_b": true, "clash_bias": _get_power_bias(_get_total_power(a), _get_total_power(b)) * 0.35}
+
+
+func _get_beam_pair_key(source_a: String, source_b: String) -> String:
+	var keys := [source_a, source_b]
+	keys.sort()
+	return "%s|%s" % [keys[0], keys[1]]
+
+
+func _get_pushed_beam_clash_point(
+	pair_key: String,
+	collision_point: Vector3,
+	origin_a: Vector3,
+	target_a: Vector3,
+	t_a: float,
+	origin_b: Vector3,
+	target_b: Vector3,
+	t_b: float,
+	clash_bias: float
+) -> Vector3:
+	var desired := collision_point
+	var bias := clampf(clash_bias, -1.0, 1.0)
+	var push := absf(bias) * BEAM_CLASH_MAX_PUSH_FRACTION
+	if push > 0.01:
+		if bias > 0.0:
+			var pushed_t := lerpf(t_b, 0.03, push)
+			desired = origin_b.lerp(target_b, clampf(pushed_t, 0.0, 1.0))
+		else:
+			var pushed_t := lerpf(t_a, 0.03, push)
+			desired = origin_a.lerp(target_a, clampf(pushed_t, 0.0, 1.0))
+	var previous := _beam_clash_points.get(pair_key, desired) as Vector3
+	var smoothed := previous.lerp(desired, BEAM_CLASH_SMOOTHING)
+	_beam_clash_points[pair_key] = smoothed
+	return smoothed
+
+
+func _get_power_bias(power_a: float, power_b: float) -> float:
+	var high_power: float = maxf(absf(power_a), absf(power_b))
+	if high_power <= 0.001:
+		return 0.0
+	return clampf((power_a - power_b) / high_power, -1.0, 1.0)
+
+
+func _is_steam_reaction(opposing_pair: Array[String]) -> bool:
+	return opposing_pair.has("Fire") and opposing_pair.has("Water")
+
+
+func _maybe_spawn_beam_collision_impact(source_a: String, source_b: String, spell: SpellDefinition, position: Vector3, normal: Vector3) -> void:
+	var pair_key := _get_beam_pair_key(source_a, source_b)
+	var now := Time.get_ticks_msec() / 1000.0
+	if now - float(_beam_collision_impacts.get(pair_key, -99.0)) < BEAM_COLLISION_IMPACT_INTERVAL:
+		return
+	_beam_collision_impacts[pair_key] = now
+	var effect := SpellImpactEffectScript.new()
+	get_tree().current_scene.add_child(effect)
+	effect.initialize(spell, position, normal, null)
+	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
+		broadcast_spell_impact(spell, position, normal)
+
+
+func _maybe_spawn_beam_wall_impact(source_key: String, wall: Node3D, spell: SpellDefinition, position: Vector3, front_normal: Vector3) -> void:
+	var wall_key := "wall:%d" % wall.get_instance_id()
+	var pair_key := _get_beam_pair_key(source_key, wall_key)
+	var now := Time.get_ticks_msec() / 1000.0
+	if now - float(_beam_collision_impacts.get(pair_key, -99.0)) < BEAM_COLLISION_IMPACT_INTERVAL:
+		return
+	_beam_collision_impacts[pair_key] = now
+	var effect := SpellImpactEffectScript.new()
+	get_tree().current_scene.add_child(effect)
+	effect.initialize(spell, position, front_normal, null)
+	effect.set_blocking_plane(wall.global_position, front_normal)
+	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
+		broadcast_spell_impact(spell, position, front_normal)
+
+
+func _prune_stale_beam_segments() -> void:
+	var now := Time.get_ticks_msec() / 1000.0
+	for key in _active_beam_segments.keys():
+		var segment := _active_beam_segments[key] as Dictionary
+		if now - float(segment.get("updated_at", 0.0)) > 0.5:
+			_active_beam_segments.erase(key)
+	for key in _beam_collision_impacts.keys():
+		if now - float(_beam_collision_impacts[key]) > 2.0:
+			_beam_collision_impacts.erase(key)
+	for key in _beam_clash_points.keys():
+		var key_text := str(key)
+		var parts := key_text.split("|", false)
+		if parts.size() != 2 or not _active_beam_segments.has(parts[0]) or not _active_beam_segments.has(parts[1]):
+			_beam_clash_points.erase(key)
+
+
+func _get_beam_collision_radius(spell: SpellDefinition) -> float:
+	return BEAM_COLLISION_RADIUS_BASE + float(spell.spell_size) * BEAM_COLLISION_RADIUS_SIZE_SCALE
+
+
+func _get_closest_segment_points(a0: Vector3, a1: Vector3, b0: Vector3, b1: Vector3) -> Dictionary:
+	var u := a1 - a0
+	var v := b1 - b0
+	var w := a0 - b0
+	var a := u.dot(u)
+	var b := u.dot(v)
+	var c := v.dot(v)
+	var d := u.dot(w)
+	var e := v.dot(w)
+	var denominator := a * c - b * b
+	var sc := 0.0
+	var tc := 0.0
+	if denominator > 0.0001:
+		sc = clampf((b * e - c * d) / denominator, 0.0, 1.0)
+	if c > 0.0001:
+		tc = clampf((b * sc + e) / c, 0.0, 1.0)
+	if a > 0.0001:
+		sc = clampf((b * tc - d) / a, 0.0, 1.0)
+	var point_a := a0 + u * sc
+	var point_b := b0 + v * tc
+	return {
+		"point_a": point_a,
+		"point_b": point_b,
+		"t_a": sc,
+		"t_b": tc,
+		"distance": point_a.distance_to(point_b),
+	}
+
+
+func _find_opposing_pair(a: SpellDefinition, b: SpellDefinition) -> Array[String]:
+	for base_a in a.get_base_elements():
+		for base_b in b.get_base_elements():
+			var props: Dictionary = BASE_PROPERTIES.get(base_a, {})
+			var opposing: Array = props.get("opposing", [])
+			if opposing.has(base_b):
+				return [base_a, base_b]
+	return []
+
+
+func _get_opposition_power(spell: SpellDefinition, base: String) -> float:
+	var weights := spell.get_base_weights()
+	var weight := float(weights.get(base, 0)) / 100.0
+	return weight * float(spell.intensity) * float(spell.spell_size)
+
+
+func _get_total_power(spell: SpellDefinition) -> float:
+	return float(spell.intensity) * float(spell.spell_size)
+
+
+func _get_spell_temperature(spell: SpellDefinition) -> float:
+	return _get_weighted_base_property(spell, "temperature", 5.0)
+
+
+func _get_spell_density(spell: SpellDefinition) -> float:
+	return _get_weighted_base_property(spell, "density", 1.0)
+
+
+func _get_weighted_base_property(spell: SpellDefinition, property: String, fallback: float) -> float:
+	var weights := spell.get_base_weights()
+	var total := 0.0
+	var value := 0.0
+	for base in weights.keys():
+		var weight := float(weights[base])
+		total += weight
+		var props: Dictionary = BASE_PROPERTIES.get(str(base), {})
+		value += float(props.get(property, fallback)) * weight
+	if total <= 0.0:
+		return fallback
+	return value / total
+
+
+func _get_wave_interference(a: SpellDefinition, b: SpellDefinition, direction_a: Vector3, direction_b: Vector3) -> float:
+	var phase_delta: float = _get_wave_phase(a) - _get_wave_phase(b)
+	var phase_alignment := cos(phase_delta)
+	var direction_alignment := direction_a.normalized().dot(direction_b.normalized())
+	var aim_factor: float = clampf((1.0 - direction_alignment) * 0.5, 0.0, 1.0)
+	return clampf(phase_alignment * 0.75 - aim_factor * 0.35, -1.0, 1.0)
+
+
+func _get_cancel_strength(interference: float) -> float:
+	return clampf(-interference, 0.0, 1.0)
+
+
+func _get_wave_phase(spell: SpellDefinition) -> float:
+	var lifetime := Time.get_ticks_msec() / 1000.0
+	return _get_base_phase_offset(spell.get_dominant_base()) + lifetime * _get_wave_frequency(spell) * TAU
+
+
+func _get_wave_frequency(spell: SpellDefinition) -> float:
+	return 0.65 + spell.spell_speed * 0.08 + spell.intensity * 0.035 + spell.get_base_elements().size() * 0.06
+
+
+func _get_base_phase_offset(base: String) -> float:
+	match base:
+		"Fire": return 0.0
+		"Water": return PI
+		"Air": return PI * 0.33
+		"Earth": return PI * 1.33
+		"Spirit": return PI * 0.72
+		"Light": return PI * 0.18
+		"Void": return PI * 1.18
+		_: return 0.0
+
+
+func _create_reaction_spell(a: SpellDefinition, b: SpellDefinition, opposing_pair: Array[String], strength_scale: float = 1.0) -> SpellDefinition:
+	var spell := SpellDefinition.new()
+	spell.spell_name = "Steam Clash" if _is_steam_reaction(opposing_pair) else "Beam Clash"
+	spell.base_element = opposing_pair[0]
+	spell.base_weights = {opposing_pair[0]: 50, opposing_pair[1]: 50}
+	spell.shape = "Sphere"
+	spell.intensity = max(1, int(round((a.intensity + b.intensity) * 0.5 * strength_scale)))
+	spell.spell_size = max(1, int(round((a.spell_size + b.spell_size) * 0.5 * strength_scale)))
+	spell.spell_range = 1
+	spell.spell_speed = 1
+	if _is_steam_reaction(opposing_pair):
+		spell.burns = true
+		spell.cools = true
+	return spell
+
+
 func broadcast_spell_impact(spell: SpellDefinition, position: Vector3, normal: Vector3) -> void:
 	if multiplayer.multiplayer_peer == null or not multiplayer.is_server():
 		return
-	_client_spawn_spell_impact.rpc(SpellNetworkCodecScript.to_dict(spell), position, normal)
+	var spell_data := SpellNetworkCodecScript.to_dict(spell)
+	var impact_id := _remember_spell_impact(spell_data, position, normal)
+	_client_spawn_spell_impact.rpc(impact_id, spell_data, position, normal, 0.0)
 
 
-@rpc("any_peer", "reliable")
-func _client_spawn_spell_impact(spell_data: Dictionary, position: Vector3, normal: Vector3) -> void:
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server() and multiplayer.get_remote_sender_id() != 1:
-		return
+@rpc("authority", "reliable")
+func _client_spawn_spell_impact(impact_id: int, spell_data: Dictionary, position: Vector3, normal: Vector3, age: float = 0.0) -> void:
 	if multiplayer.is_server():
 		return
 	var effect := SpellImpactEffectScript.new()
+	effect.name = "SpellImpact_%d" % impact_id
 	get_tree().current_scene.add_child(effect)
-	effect.initialize(SpellNetworkCodecScript.from_dict(spell_data), position, normal, null)
+	effect.initialize(SpellNetworkCodecScript.from_dict(spell_data), position, normal, null, age)
 	effect.set_visual_only(true)
 
+
+func _remember_spell_impact(spell_data: Dictionary, position: Vector3, normal: Vector3) -> int:
+	_prune_expired_spell_impacts()
+	var spell := SpellNetworkCodecScript.from_dict(spell_data)
+	var lifetime: float = SpellImpactEffectScript.estimate_lifetime(spell)
+	var impact_id := _next_spell_impact_id
+	_next_spell_impact_id += 1
+	_active_spell_impacts.append({
+		"id": impact_id,
+		"spell_data": spell_data,
+		"position": position,
+		"normal": normal,
+		"created_at": Time.get_ticks_msec() / 1000.0,
+		"lifetime": lifetime,
+	})
+	return impact_id
+
+
+func _send_active_spell_impacts(peer_id: int) -> void:
+	if multiplayer.multiplayer_peer == null or not multiplayer.is_server():
+		return
+	_prune_expired_spell_impacts()
+	var now := Time.get_ticks_msec() / 1000.0
+	for impact in _active_spell_impacts:
+		var age := now - float(impact["created_at"])
+		_client_spawn_spell_impact.rpc_id(
+			peer_id,
+			int(impact["id"]),
+			impact["spell_data"] as Dictionary,
+			impact["position"] as Vector3,
+			impact["normal"] as Vector3,
+			age
+		)
+
+
+func _prune_expired_spell_impacts() -> void:
+	var now := Time.get_ticks_msec() / 1000.0
+	for i in range(_active_spell_impacts.size() - 1, -1, -1):
+		var impact := _active_spell_impacts[i]
+		if now - float(impact["created_at"]) >= float(impact["lifetime"]):
+			_active_spell_impacts.remove_at(i)
+
+
+func broadcast_push_test_target_state(pos: Vector3, rot: Vector3, lin_vel: Vector3, ang_vel: Vector3) -> void:
+	if multiplayer.multiplayer_peer == null or not multiplayer.is_server():
+		return
+	_client_receive_push_test_target_state.rpc(pos, rot, lin_vel, ang_vel)
+
+
+@rpc("authority", "unreliable")
+func _client_receive_push_test_target_state(pos: Vector3, rot: Vector3, lin_vel: Vector3, ang_vel: Vector3) -> void:
+	if multiplayer.is_server():
+		return
+	var target := get_node_or_null("PushTestTarget")
+	if target == null:
+		return
+	if target.has_method("_client_receive_state"):
+		target._client_receive_state(pos, rot, lin_vel, ang_vel)
 
 
 func _spawn_push_test_target() -> void:
 	var target := RigidBody3D.new()
+	target.name = "PushTestTarget"
 	target.set_script(PushTestTargetScript)
 	target.position = Vector3(3.0, 0.8, -9.5)
 	add_child(target)

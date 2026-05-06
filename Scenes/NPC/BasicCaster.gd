@@ -17,6 +17,16 @@ const DIRECT_GRAVITY_RADIUS := 3.0
 const MAX_MANA := 100.0
 const MANA_REGEN_PER_SECOND := 14.0
 const KILL_ZONE_Y := -12.0
+const REMOTE_INTERPOLATION_DELAY := 0.14
+const REMOTE_SNAPSHOT_LIMIT := 12
+const REMOTE_EXTRAPOLATION_LIMIT := 0.2
+const NPC_BODY_COLOR := Color(0.18, 0.07, 0.22)
+const NPC_EMISSION_COLOR := Color(1.0, 0.18, 0.82)
+const NPC_LABEL_COLOR := Color(1.0, 0.48, 0.92)
+const BURN_DURATION := 2.4
+const BURN_TICK_INTERVAL := 0.75
+const BURN_DAMAGE_SCALE := 0.35
+const DEATH_ANIMATION_DURATION := 0.75
 
 var target: Node3D
 var _cooldown: float = 1.6
@@ -29,15 +39,29 @@ var _knockback_velocity: Vector3 = Vector3.ZERO
 var _strafe_dir: float = 1.0
 var _strafe_timer: float = 0.0
 var _blind_timer: float = 0.0
+var _burn_timer: float = 0.0
+var _burn_tick_timer: float = 0.0
+var _burn_tick_damage: int = 0
 var _attack_index: int = 0
 var _body: Node3D
+var _body_mesh: MeshInstance3D
+var _body_material: StandardMaterial3D
+var _cast_marker: MeshInstance3D
 var _collision_shape: CollisionShape3D
 var _health_label: Label3D
 var _cast_origin: Node3D
+var _death_burst: MeshInstance3D
+var _death_burst_material: StandardMaterial3D
+var _death_anim_time: float = 0.0
+var _death_anim_active: bool = false
 var _net_sync_timer: float = 0.0
 var _spell_loadout_data: Array = []
 var _difficulty_data: Dictionary = {"difficulty": "Medium", "cast_cooldown": 3.0, "spell_budget": 120, "cast_when_ready": false}
 var _mana: float = MAX_MANA
+var _remote_snapshots: Array[Dictionary] = []
+var _remote_clock_offset: float = 0.0
+var _has_remote_clock_offset: bool = false
+var _remote_clock_samples: int = 0
 
 
 func _ready() -> void:
@@ -66,18 +90,21 @@ func _build_body() -> void:
 	mesh_inst.mesh = mesh
 	mesh_inst.position.y = 0.75
 	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.35, 0.08, 0.04)
+	mat.albedo_color = NPC_BODY_COLOR
 	mat.emission_enabled = true
-	mat.emission = Color(0.65, 0.12, 0.04)
+	mat.emission = NPC_EMISSION_COLOR
 	mat.emission_energy_multiplier = 0.25
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
 	mesh_inst.material_override = mat
 	_body.add_child(mesh_inst)
+	_body_mesh = mesh_inst
+	_body_material = mat
 
 	_health_label = Label3D.new()
 	_health_label.position = Vector3(0.0, 1.9, 0.0)
 	_health_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 	_health_label.font_size = 36
-	_health_label.modulate = Color(1.0, 0.55, 0.45)
+	_health_label.modulate = NPC_LABEL_COLOR
 	add_child(_health_label)
 	_update_health_label()
 
@@ -92,11 +119,34 @@ func _build_body() -> void:
 	marker.mesh = marker_mesh
 	marker.material_override = mat
 	_cast_origin.add_child(marker)
+	_cast_marker = marker
+
+	_death_burst_material = StandardMaterial3D.new()
+	_death_burst_material.albedo_color = Color(NPC_EMISSION_COLOR.r, NPC_EMISSION_COLOR.g, NPC_EMISSION_COLOR.b, 0.0)
+	_death_burst_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	_death_burst_material.emission_enabled = true
+	_death_burst_material.emission = NPC_EMISSION_COLOR
+	_death_burst_material.emission_energy_multiplier = 0.0
+	_death_burst_material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+
+	_death_burst = MeshInstance3D.new()
+	_death_burst.name = "DeathBurst"
+	var burst_mesh := SphereMesh.new()
+	burst_mesh.radius = 0.35
+	burst_mesh.height = 0.7
+	_death_burst.mesh = burst_mesh
+	_death_burst.material_override = _death_burst_material
+	_death_burst.position.y = 0.8
+	_death_burst.visible = false
+	add_child(_death_burst)
 
 
 func _process(delta: float) -> void:
 	if _is_network_client():
+		_update_remote_visual_transform(delta)
+		_update_death_animation(delta)
 		return
+	_update_death_animation(delta)
 	if _blind_timer > 0.0:
 		_blind_timer = maxf(0.0, _blind_timer - delta)
 		_update_health_label()
@@ -107,6 +157,7 @@ func _process(delta: float) -> void:
 		if _respawn_timer <= 0.0:
 			_respawn()
 		return
+	_tick_burn_status(delta)
 	if target == null or not is_instance_valid(target):
 		return
 	_mana = minf(MAX_MANA, _mana + MANA_REGEN_PER_SECOND * delta)
@@ -292,6 +343,7 @@ func _spell_from_dict(data: Dictionary) -> SpellDefinition:
 	spell.spell_size = int(data.get("spell_size", 1))
 	spell.spell_range = int(data.get("spell_range", 1))
 	spell.spell_speed = int(data.get("spell_speed", 1))
+	spell.wall_time = int(data.get("wall_time", 4))
 	spell.has_charging = bool(data.get("has_charging", false))
 	spell.burns = bool(data.get("burns", false))
 	spell.cools = bool(data.get("cools", false))
@@ -309,6 +361,10 @@ func _spell_from_dict(data: Dictionary) -> SpellDefinition:
 func apply_spell_hit(spell: SpellDefinition, _hit_position: Vector3, _hit_normal: Vector3, is_beam_tick: bool = false) -> void:
 	if spell == null or _is_dead:
 		return
+	if spell.cools:
+		_clear_burn()
+	if spell.burns and not spell.is_healing_spell():
+		_apply_burn(spell, is_beam_tick)
 	if spell.is_blind_spell():
 		apply_blind(spell.calculate_blind_duration(is_beam_tick))
 	_apply_pushback(spell, _hit_position, _hit_normal, is_beam_tick)
@@ -321,6 +377,41 @@ func apply_spell_hit(spell: SpellDefinition, _hit_position: Vector3, _hit_normal
 	_update_health_label()
 	if _health <= 0:
 		_die()
+
+
+func _apply_burn(spell: SpellDefinition, is_beam_tick: bool) -> void:
+	var damage_basis: int = spell.calculate_damage(is_beam_tick)
+	var tick_damage: int = maxi(1, int(round(float(damage_basis) * BURN_DAMAGE_SCALE)))
+	_burn_timer = maxf(_burn_timer, BURN_DURATION)
+	_burn_tick_damage = maxi(_burn_tick_damage, tick_damage)
+	if _burn_tick_timer <= 0.0:
+		_burn_tick_timer = BURN_TICK_INTERVAL
+
+
+func _clear_burn() -> void:
+	_burn_timer = 0.0
+	_burn_tick_timer = 0.0
+	_burn_tick_damage = 0
+
+
+func _tick_burn_status(delta: float) -> bool:
+	if _burn_timer <= 0.0 or _burn_tick_damage <= 0 or _is_dead:
+		_clear_burn()
+		return false
+	_burn_timer = maxf(0.0, _burn_timer - delta)
+	_burn_tick_timer -= delta
+	if _burn_tick_timer > 0.0:
+		if _burn_timer <= 0.0:
+			_clear_burn()
+		return false
+	_burn_tick_timer = BURN_TICK_INTERVAL
+	_health = maxi(0, _health - _burn_tick_damage)
+	_update_health_label()
+	if _health <= 0:
+		_die()
+	if _burn_timer <= 0.0 or _is_dead:
+		_clear_burn()
+	return true
 
 
 func apply_blind(duration: float) -> void:
@@ -338,14 +429,86 @@ func _update_health_label() -> void:
 			_health_label.text = "%d / %d" % [_health, MAX_HEALTH]
 
 
+func _start_death_animation() -> void:
+	_death_anim_time = 0.0
+	_death_anim_active = true
+	if _body != null:
+		_body.visible = true
+	if _body_mesh != null:
+		_body_mesh.visible = true
+	if _cast_marker != null:
+		_cast_marker.visible = true
+	if _death_burst != null:
+		_death_burst.visible = true
+		_death_burst.scale = Vector3.ONE * 0.1
+
+
+func _reset_death_animation() -> void:
+	_death_anim_time = 0.0
+	_death_anim_active = false
+	if _body != null:
+		_body.visible = true
+		_body.position = Vector3.ZERO
+		_body.rotation = Vector3.ZERO
+		_body.scale = Vector3.ONE
+	if _body_mesh != null:
+		_body_mesh.visible = true
+	if _cast_marker != null:
+		_cast_marker.visible = true
+		_cast_marker.scale = Vector3.ONE
+	if _body_material != null:
+		_body_material.albedo_color = NPC_BODY_COLOR
+		_body_material.emission = NPC_EMISSION_COLOR
+		_body_material.emission_energy_multiplier = 0.25
+	if _death_burst != null:
+		_death_burst.visible = false
+		_death_burst.scale = Vector3.ONE * 0.1
+	if _death_burst_material != null:
+		_death_burst_material.albedo_color = Color(NPC_EMISSION_COLOR.r, NPC_EMISSION_COLOR.g, NPC_EMISSION_COLOR.b, 0.0)
+		_death_burst_material.emission_energy_multiplier = 0.0
+
+
+func _update_death_animation(delta: float) -> void:
+	if not _death_anim_active:
+		return
+	_death_anim_time = minf(_death_anim_time + delta, DEATH_ANIMATION_DURATION)
+	var t := clampf(_death_anim_time / DEATH_ANIMATION_DURATION, 0.0, 1.0)
+	var slump := ease(t, -1.5)
+	if _body != null:
+		_body.rotation.z = lerpf(0.0, deg_to_rad(-74.0), slump)
+		_body.position = Vector3(0.0, lerpf(0.0, -0.26, slump), 0.0)
+		_body.scale = Vector3.ONE * lerpf(1.0, 0.72, t)
+	if _cast_marker != null:
+		_cast_marker.scale = Vector3.ONE * lerpf(1.0, 0.2, t)
+	if _body_material != null:
+		_body_material.albedo_color = Color(NPC_BODY_COLOR.r, NPC_BODY_COLOR.g, NPC_BODY_COLOR.b, lerpf(1.0, 0.08, t))
+		_body_material.emission_energy_multiplier = lerpf(0.25, 1.25, 1.0 - absf(t - 0.22) / 0.22) if t <= 0.44 else lerpf(0.28, 0.0, (t - 0.44) / 0.56)
+	if _death_burst != null:
+		_death_burst.scale = Vector3.ONE * lerpf(0.1, 1.7, ease(t, -2.0))
+	if _death_burst_material != null:
+		var alpha := sin(t * PI) * 0.38
+		_death_burst_material.albedo_color = Color(NPC_EMISSION_COLOR.r, NPC_EMISSION_COLOR.g, NPC_EMISSION_COLOR.b, alpha)
+		_death_burst_material.emission_energy_multiplier = sin(t * PI) * 1.45
+	if _death_anim_time >= DEATH_ANIMATION_DURATION:
+		_death_anim_active = false
+		if _body != null:
+			_body.visible = false
+		if _cast_marker != null:
+			_cast_marker.visible = false
+		if _death_burst != null:
+			_death_burst.visible = false
+
+
 func _die() -> void:
+	if _is_dead:
+		return
 	_is_dead = true
 	_respawn_timer = RESPAWN_DELAY
 	_knockback_velocity = Vector3.ZERO
 	_blind_timer = 0.0
+	_clear_burn()
 	_timer = _cooldown
-	if _body != null:
-		_body.visible = false
+	_start_death_animation()
 	if _collision_shape != null:
 		_collision_shape.disabled = true
 	collision_layer = 0
@@ -360,10 +523,10 @@ func _respawn() -> void:
 	_health = MAX_HEALTH
 	_knockback_velocity = Vector3.ZERO
 	_blind_timer = 0.0
+	_clear_burn()
 	global_position = _spawn_position
 	velocity = Vector3.ZERO
-	if _body != null:
-		_body.visible = true
+	_reset_death_animation()
 	if _collision_shape != null:
 		_collision_shape.disabled = false
 	collision_layer = 1
@@ -415,20 +578,88 @@ func _sync_network_state(delta: float) -> void:
 	if _net_sync_timer > 0.0:
 		return
 	_net_sync_timer = 0.1
-	_client_receive_state.rpc(global_position, rotation.y, _health, _is_dead, _blind_timer)
+	var world := get_tree().current_scene
+	if world != null and world.has_method("broadcast_basic_caster_state"):
+		world.broadcast_basic_caster_state(_get_network_bot_id(), global_position, rotation.y, _health, _is_dead, _blind_timer, _network_time())
+		return
+	_client_receive_state.rpc(global_position, rotation.y, _health, _is_dead, _blind_timer, _network_time())
+
+
+func _get_network_bot_id() -> int:
+	if name.begins_with("BasicCaster_"):
+		return int(name.trim_prefix("BasicCaster_"))
+	return 0
 
 
 @rpc("authority", "unreliable")
-func _client_receive_state(pos: Vector3, yaw: float, health: int, is_dead: bool, blind_timer: float) -> void:
+func _client_receive_state(pos: Vector3, yaw: float, health: int, is_dead: bool, blind_timer: float, timestamp: float = -1.0) -> void:
 	if multiplayer.is_server():
 		return
-	global_position = pos
-	rotation.y = yaw
+	var was_dead := _is_dead
 	_health = health
 	_is_dead = is_dead
 	_blind_timer = blind_timer
-	if _body != null:
-		_body.visible = not _is_dead
+	_add_remote_snapshot(pos, yaw, timestamp if timestamp >= 0.0 else _network_time())
+	if _is_dead and not was_dead:
+		_start_death_animation()
+	elif not _is_dead and was_dead:
+		_reset_death_animation()
 	if _collision_shape != null:
 		_collision_shape.disabled = _is_dead
 	_update_health_label()
+
+
+func _add_remote_snapshot(pos: Vector3, yaw: float, timestamp: float) -> void:
+	var local_time := _network_time()
+	var measured_offset := local_time - timestamp
+	if not _has_remote_clock_offset:
+		_remote_clock_offset = measured_offset
+		_has_remote_clock_offset = true
+	else:
+		_remote_clock_samples += 1
+		var alpha := 0.15 if _remote_clock_samples < 30 else 0.03
+		_remote_clock_offset = lerpf(_remote_clock_offset, measured_offset, alpha)
+	_remote_snapshots.append({
+		"t": timestamp + _remote_clock_offset,
+		"pos": pos,
+		"yaw": yaw,
+	})
+	while _remote_snapshots.size() > REMOTE_SNAPSHOT_LIMIT:
+		_remote_snapshots.pop_front()
+	if _remote_snapshots.size() == 1:
+		global_position = pos
+		rotation.y = yaw
+
+
+func _update_remote_visual_transform(_delta: float) -> void:
+	if _remote_snapshots.is_empty():
+		return
+	var render_time := _network_time() - REMOTE_INTERPOLATION_DELAY
+	if _remote_snapshots.size() == 1:
+		_apply_remote_snapshot(_remote_snapshots[0])
+		return
+	for i in range(1, _remote_snapshots.size()):
+		var older: Dictionary = _remote_snapshots[i - 1]
+		var newer: Dictionary = _remote_snapshots[i]
+		if float(older["t"]) <= render_time and float(newer["t"]) >= render_time:
+			var span := maxf(float(newer["t"]) - float(older["t"]), 0.001)
+			var t := clampf((render_time - float(older["t"])) / span, 0.0, 1.0)
+			global_position = (older["pos"] as Vector3).lerp(newer["pos"] as Vector3, t)
+			rotation.y = lerp_angle(float(older["yaw"]), float(newer["yaw"]), t)
+			return
+	var latest: Dictionary = _remote_snapshots[_remote_snapshots.size() - 1]
+	var previous: Dictionary = _remote_snapshots[_remote_snapshots.size() - 2]
+	var elapsed := clampf(render_time - float(latest["t"]), 0.0, REMOTE_EXTRAPOLATION_LIMIT)
+	var span := maxf(float(latest["t"]) - float(previous["t"]), 0.001)
+	var estimated_velocity := ((latest["pos"] as Vector3) - (previous["pos"] as Vector3)) / span
+	global_position = latest["pos"] as Vector3 + estimated_velocity * elapsed
+	rotation.y = float(latest["yaw"])
+
+
+func _apply_remote_snapshot(snapshot: Dictionary) -> void:
+	global_position = snapshot["pos"] as Vector3
+	rotation.y = float(snapshot["yaw"])
+
+
+func _network_time() -> float:
+	return Time.get_ticks_msec() / 1000.0

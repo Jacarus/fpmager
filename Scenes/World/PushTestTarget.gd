@@ -21,7 +21,7 @@ func _ready() -> void:
 
 
 func _physics_process(delta: float) -> void:
-	if multiplayer.multiplayer_peer == null:
+	if not multiplayer.has_multiplayer_peer():
 		return
 	if _is_network_client():
 		return
@@ -31,6 +31,10 @@ func _physics_process(delta: float) -> void:
 	if _sync_timer > 0.0:
 		return
 	_sync_timer = NETWORK_SYNC_RATE
+	var world := get_tree().current_scene
+	if world != null and world.has_method("broadcast_push_test_target_state"):
+		world.broadcast_push_test_target_state(global_position, global_rotation, linear_velocity, angular_velocity)
+		return
 	_client_receive_state.rpc(global_position, global_rotation, linear_velocity, angular_velocity)
 
 
@@ -118,4 +122,9 @@ func _client_receive_state(pos: Vector3, rot: Vector3, lin_vel: Vector3, ang_vel
 
 
 func _is_network_client() -> bool:
-	return multiplayer.multiplayer_peer != null and not multiplayer.is_server()
+	if not multiplayer.has_multiplayer_peer():
+		return false
+	var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+	if peer == null or peer.get_connection_status() != MultiplayerPeer.CONNECTION_CONNECTED:
+		return false
+	return not multiplayer.is_server()
