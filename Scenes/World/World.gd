@@ -266,8 +266,10 @@ func _request_world_state(requested_peer_id: int = 0) -> void:
 	_send_active_spell_impacts(peer_id)
 
 
-@rpc("authority", "reliable")
+@rpc("any_peer", "reliable")
 func _spawn_player_for_peer(peer_id: int, spawn_position: Vector3, player_color: Color = Color(0.18, 0.14, 0.24)) -> void:
+	if not multiplayer.is_server():
+		return
 	if _players.has(peer_id):
 		return
 	var local_unique_id := 0
@@ -424,8 +426,10 @@ func _spawn_basic_caster_for_all(bot_id: int, spawn_position: Vector3, loadout_d
 	_spawn_basic_caster_local(bot_id, spawn_position, loadout_data, difficulty_data)
 
 
-@rpc("authority", "reliable")
+@rpc("any_peer", "reliable")
 func _spawn_basic_caster_for_peer(bot_id: int, spawn_position: Vector3, loadout_data: Array, difficulty_data: Dictionary) -> void:
+	if not multiplayer.is_server():
+		return
 	print("[World] _spawn_basic_caster_for_peer called: bot_id=%d, position=%s" % [bot_id, str(spawn_position)])
 	_spawn_basic_caster_local(bot_id, spawn_position, loadout_data, difficulty_data)
 
@@ -584,8 +588,10 @@ func _spawn_boss_for_all(boss_id: int, spawn_position: Vector3, settings: Dictio
 	_spawn_boss_local(boss_id, spawn_position, settings)
 
 
-@rpc("authority", "reliable")
+@rpc("any_peer", "reliable")
 func _spawn_boss_for_peer(boss_id: int, spawn_position: Vector3, settings: Dictionary) -> void:
+	if not multiplayer.is_server():
+		return
 	_spawn_boss_local(boss_id, spawn_position, settings)
 
 

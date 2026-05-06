@@ -21,7 +21,7 @@ func _ready() -> void:
 
 
 func _physics_process(delta: float) -> void:
-	if multiplayer.multiplayer_peer == null:
+	if not multiplayer.has_multiplayer_peer():
 		return
 	if _is_network_client():
 		return
