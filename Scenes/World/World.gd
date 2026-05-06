@@ -76,7 +76,12 @@ func _ready() -> void:
 
 
 func _process(_delta: float) -> void:
-	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
+	var is_connected := false
+	if multiplayer.multiplayer_peer != null:
+		var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+		is_connected = peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED
+	
+	if is_connected and multiplayer.is_server():
 		_prune_expired_spell_impacts()
 	else:
 		_prune_predicted_projectile_echoes()
@@ -88,7 +93,12 @@ func _process(_delta: float) -> void:
 
 
 func _setup_multiplayer_world() -> void:
-	if multiplayer.is_server():
+	var is_server := false
+	if multiplayer.multiplayer_peer != null:
+		var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+		is_server = peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED and multiplayer.is_server()
+	
+	if is_server:
 		if not multiplayer.peer_disconnected.is_connected(_on_peer_disconnected):
 			multiplayer.peer_disconnected.connect(_on_peer_disconnected)
 		if not _is_dedicated_server():
@@ -118,7 +128,12 @@ func _request_world_state_from_server() -> void:
 
 
 func _retry_world_state_request(delta: float) -> void:
-	if multiplayer.multiplayer_peer == null or multiplayer.is_server():
+	if multiplayer.multiplayer_peer == null:
+		return
+	var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+	if peer == null or peer.get_connection_status() != MultiplayerPeer.CONNECTION_CONNECTED:
+		return
+	if multiplayer.is_server():
 		return
 	if _player != null:
 		return
@@ -312,7 +327,12 @@ func _assign_player_color(peer_id: int) -> Color:
 
 
 func _get_player_color(peer_id: int) -> Color:
-	if multiplayer.multiplayer_peer != null and multiplayer.is_server():
+	var is_server := false
+	if multiplayer.multiplayer_peer != null:
+		var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+		is_server = peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED and multiplayer.is_server()
+	
+	if is_server:
 		return _assign_player_color(peer_id)
 	var index := int(_player_color_indices.get(peer_id, 0))
 	return PLAYER_COLORS[clampi(index, 0, PLAYER_COLORS.size() - 1)]
@@ -349,11 +369,17 @@ func _on_boss_settings_changed() -> void:
 
 
 func _can_manage_bots() -> bool:
-	return multiplayer.multiplayer_peer == null or multiplayer.is_server()
+	if multiplayer.multiplayer_peer == null:
+		return true
+	var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+	return peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED and multiplayer.is_server()
 
 
 func _can_manage_bosses() -> bool:
-	return multiplayer.multiplayer_peer == null or multiplayer.is_server()
+	if multiplayer.multiplayer_peer == null:
+		return true
+	var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+	return peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED and multiplayer.is_server()
 
 
 func _reconcile_configured_bots() -> void:
