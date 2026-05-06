@@ -1818,7 +1818,12 @@ func _update_local_fall_damage_after_move(was_on_floor_at_start: bool) -> void:
 		velocity.y = 0.0
 		if not was_on_floor_at_start:
 			_external_velocity.y = 0.0
-	if multiplayer.multiplayer_peer != null and not multiplayer.is_server():
+	var is_network_client := false
+	if multiplayer.multiplayer_peer != null:
+		var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+		is_network_client = peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED and not multiplayer.is_server()
+	
+	if is_network_client:
 		if now_on_floor and not _was_on_floor_last_frame:
 			_absorb_landing_momentum(maxf(0.0, _fall_peak_y - global_position.y))
 		_was_on_floor_last_frame = now_on_floor
@@ -1899,13 +1904,21 @@ func _sync_network_state(delta: float) -> void:
 	_net_send_timer = 0.0
 	var head_pitch := _head.rotation.x if _head != null else 0.0
 	var timestamp := _network_time()
-	if multiplayer.is_server():
+	
+	var is_connected := false
+	var is_server := false
+	if multiplayer.multiplayer_peer != null:
+		var peer := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+		is_connected = peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED
+		is_server = is_connected and multiplayer.is_server()
+	
+	if is_server:
 		var world := get_tree().current_scene
 		if world != null and world.has_method("broadcast_player_transform_state"):
 			world.broadcast_player_transform_state(_network_peer_id, global_position, velocity, rotation.y, head_pitch, timestamp)
 			return
 		_client_receive_player_state.rpc(_network_peer_id, global_position, velocity, rotation.y, head_pitch, timestamp)
-	else:
+	elif is_connected:
 		_server_receive_player_state.rpc_id(1, global_position, velocity, rotation.y, head_pitch, timestamp)
 
 
