@@ -20,22 +20,47 @@ Before hosting, Create opens host settings:
     -Bots: on/off
     -Number of bots: enabled only when Bots is on
     -Bot difficulty: Easy, Medium, Hard; enabled only when Bots is on
+    -Boss: on/off
+    -Boss health: enabled only when Boss is on
+    -Boss size: enabled only when Boss is on
+    -Ability cooldown: enabled only when Boss is on
+    -Boss speed: enabled only when Boss is on
+    -Boss respawns: enabled only when Boss is on
 When Bots is off, no NPC casters spawn. When Bots is on, the server spawns the
 chosen number of NPC casters.
+When Boss is on, the server spawns one Aether Colossus boss using the selected
+health, size, ability cooldown, movement speed, and respawn settings.
 Dedicated servers can change bot settings while running by appending commands to
 the server command file. Supported commands are:
     -status
-    -bots on
+    -bots on  (enables bots and forces reconcile, even if bots are already on)
     -bots off
     -bots <0-12>
     -bot_count <0-12>
     -bot_difficulty <Easy|Medium|Hard>
+    -bot status     (prints world bot count and current settings)
+    -bot reconcile  (forces the world to reconcile bots from current settings)
+Bot commands always trigger a bot reconcile on the server, so sending "bots on"
+when bots are already running will respawn any missing bots. The dedicated
+server invokes the world's reconcile directly after each accepted bot command,
+in addition to the bot_settings_changed signal, so reconcile still happens even
+if a peer is in an unusual state.
 On Fly, the command file is /tmp/fp-mager-commands.txt. For example:
     fly ssh console --app fp-mager --command "sh -lc 'echo bots off >> /tmp/fp-mager-commands.txt'"
     fly ssh console --app fp-mager --command "sh -lc 'echo bot_count 4 >> /tmp/fp-mager-commands.txt'"
 From Windows, Scripts\server_command.bat wraps that Fly command:
     Scripts\server_command.bat bots on
     Scripts\server_command.bat bot_difficulty Hard
+    Scripts\server_command.bat boss status
+    Scripts\server_command.bat boss spawn health=2400 name=Aether_Colossus scale=1.2 cooldown=0.85 speed=1.1 respawn=off
+    Scripts\server_command.bat boss replace health=4000 respawn=on
+For local dedicated-server testing, start the server from the repo root:
+    Scripts\start_local_dedicated_server.bat
+Then, in another terminal, append commands to the same local command file:
+    Scripts\local_server_command.bat status
+    Scripts\local_server_command.bat bots on
+    Scripts\local_server_command.bat boss replace health=2400 respawn=on
+The local server prints each accepted command as [ServerCommand] output.
 Join asks for a server address and port, then connects to that hosted game.
 For internet play, the host must allow/forward UDP port 24567, or the selected
 join port, through their firewall/router.
@@ -78,6 +103,8 @@ Online multiplayer uses Godot ENet networking.
     -Server combat state also includes external movement velocity, so authoritative
      Water push, caster recoil, and Void/Earth gravity impulses are applied on the
      owning client instead of only on the server copy.
+    -Server-side external movement velocity decays for client-owned players too, so
+     old push or gravity impulses are not rebroadcast by later combat events.
     -Server-owned physics test objects, such as the blue push test box, replicate
      their transform and velocity to clients after push/gravity impulses.
     -Projectile casts are requested by clients, spawned by the server through the
@@ -107,6 +134,10 @@ Online multiplayer uses Godot ENet networking.
     -When a player opens the spell creator from the in-game menu, the server despawns
      their player body for all peers. Closing the creator requests a fresh spawn so
      loadout changes are picked up by the new player instance.
+    -While a peer is in the spell creator, the server tracks them in an "in creator"
+     set and will not respawn them on a stray world-state request. The client also
+     suppresses its own world-state retry while its creator overlay is open, so the
+     creator UI is never interrupted by an unwanted player respawn.
     -Saved spell resources are loaded with cache bypassing when returning to gameplay,
      so edited spells and loadout assignments use the latest saved data.
     -After respawn, the server briefly ignores stale client movement packets and
@@ -138,6 +169,60 @@ Online multiplayer uses Godot ENet networking.
      instead of instantly passing through.
     -Fire/Water beam clashes stop both beams and create a larger Steam Clash cloud at
      the collision point.
+    -Boss NPCs can be spawned by script/server command with per-spawn settings.
+     A boss is a large, server-authoritative multi-part enemy. Its overall raid-style
+     health bar is replicated to every player through the world HUD.
+    -Boss parts are individually damageable. Each major part controls an ability:
+        Prism Arm: charges briefly, then fires five Light sphere projectiles toward
+        pressure points around the arena. These use the normal projectile path, so
+        players can see, dodge, and counter them with spell collisions.
+        Core: telegraphs a large ground circle before a boss-only Cataclysm AOE lands.
+        Gravity Arm: telegraphs multiple ground circles before Void/Earth Singularity
+        fields appear.
+        Anchor Feet: damageable movement component; destroying it stops boss movement.
+        Crown: command part for future phase/AI tuning.
+      Destroying a part disables the ability tied to that part.
+      Part max health is scaled from the boss's configured max health, so higher-health
+      boss spawns also make each component tougher.
+      Boss ground attacks are only placed outside the boss's own danger radius, so
+      Cataclysm and Gravity Wells are not chosen when they would land on the boss.
+      When the boss is defeated, pending boss attacks are cancelled. If respawn is
+      enabled, it returns after its respawn delay; otherwise it despawns after 5 seconds.
+    -Boss AI is server-authoritative. It scores live player targets by distance,
+     clustering, and target stickiness, then moves around the selected target while
+     trying to maintain a medium engagement range. It chases players who kite too far,
+     backs away from players who get too close, strafes during pressure windows, and
+     drifts back toward the arena center.
+    -Boss attack choice is weighted by target distance, player clustering, surviving
+     parts, cooldowns, and the previous attack. This makes it prefer Cataclysm against
+     clustered/near players, Gravity Wells against farther players, and Prism Split as
+     ranged pressure, while reducing immediate repeats.
+    -Boss abilities use boss-only spell definitions and are not available in the
+     player spell creator/loadout budget.
+    -Boss attacks that appear directly on the ground must create a visible countdown
+     telegraph first. The warning zone is replicated to clients before the
+     server-authoritative impact or lingering field is spawned.
+    -Scripts can call:
+        get_tree().current_scene.spawn_boss({
+            "display_name": "Aether Colossus",
+            "max_health": 2400,
+            "avatar_scale": 1.2,
+            "ability_cooldown_scale": 0.85,
+            "movement_speed_scale": 1.1,
+            "respawn_enabled": false,
+            "blind_volley_enabled": true,
+            "large_aoe_enabled": true,
+            "singularity_enabled": true
+        })
+      Dedicated servers also accept:
+        boss spawn health=2400 name=Aether_Colossus scale=1.2 cooldown=0.85 speed=1.1 respawn=off
+        boss spawn health=2400 replace=on
+        boss replace health=4000 respawn=on
+        boss despawn 0
+        boss status
+      After a defeated non-respawning boss despawns, running boss spawn again creates a
+      fresh boss. For local testing, use Play -> Create, enable Boss, choose
+      health/size/cooldown/speed/respawn, then Start Host.
 
 ##Spell creation##
 UI should dynamically update to show what the spell will look like in the characters hands / body (i.e. growing larger as its size is increased)

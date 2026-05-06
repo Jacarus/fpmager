@@ -13,6 +13,12 @@ var _port_input: SpinBox
 var _bots_check: CheckBox
 var _bot_count_spin: SpinBox
 var _difficulty_options: OptionButton
+var _boss_check: CheckBox
+var _boss_health_spin: SpinBox
+var _boss_scale_spin: SpinBox
+var _boss_cooldown_spin: SpinBox
+var _boss_speed_spin: SpinBox
+var _boss_respawn_check: CheckBox
 var _fullscreen_btn: Button
 
 
@@ -62,7 +68,7 @@ func _build_ui() -> void:
 	title.add_theme_color_override("font_color", Color(0.92, 0.84, 1.0))
 	_root_box.add_child(title)
 
-	_root_box.add_child(HSeparator.new())
+	_add_menu_item(HSeparator.new())
 
 	_status_label = Label.new()
 	_status_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -176,6 +182,57 @@ func _show_host_options() -> void:
 	_difficulty_options.disabled = not _bots_check.button_pressed
 	_add_menu_item(_difficulty_options)
 
+	_add_menu_item(HSeparator.new())
+
+	_boss_check = CheckBox.new()
+	_boss_check.text = "Boss"
+	_boss_check.button_pressed = GameSettings.boss_enabled
+	_boss_check.toggled.connect(_on_boss_toggled)
+	_add_menu_item(_boss_check)
+
+	_boss_health_spin = SpinBox.new()
+	_boss_health_spin.min_value = 500
+	_boss_health_spin.max_value = 10000
+	_boss_health_spin.step = 100
+	_boss_health_spin.value = GameSettings.boss_max_health
+	_boss_health_spin.prefix = "Boss health "
+	_boss_health_spin.editable = _boss_check.button_pressed
+	_add_menu_item(_boss_health_spin)
+
+	_boss_scale_spin = SpinBox.new()
+	_boss_scale_spin.min_value = 0.5
+	_boss_scale_spin.max_value = 2.5
+	_boss_scale_spin.step = 0.1
+	_boss_scale_spin.value = GameSettings.boss_avatar_scale
+	_boss_scale_spin.prefix = "Boss size x"
+	_boss_scale_spin.editable = _boss_check.button_pressed
+	_add_menu_item(_boss_scale_spin)
+
+	_boss_cooldown_spin = SpinBox.new()
+	_boss_cooldown_spin.min_value = 0.25
+	_boss_cooldown_spin.max_value = 3.0
+	_boss_cooldown_spin.step = 0.05
+	_boss_cooldown_spin.value = GameSettings.boss_ability_cooldown_scale
+	_boss_cooldown_spin.prefix = "Ability cooldown x"
+	_boss_cooldown_spin.editable = _boss_check.button_pressed
+	_add_menu_item(_boss_cooldown_spin)
+
+	_boss_speed_spin = SpinBox.new()
+	_boss_speed_spin.min_value = 0.25
+	_boss_speed_spin.max_value = 3.0
+	_boss_speed_spin.step = 0.05
+	_boss_speed_spin.value = GameSettings.boss_movement_speed_scale
+	_boss_speed_spin.prefix = "Boss speed x"
+	_boss_speed_spin.editable = _boss_check.button_pressed
+	_add_menu_item(_boss_speed_spin)
+
+	_boss_respawn_check = CheckBox.new()
+	_boss_respawn_check.text = "Boss respawns"
+	_boss_respawn_check.button_pressed = GameSettings.boss_respawn_enabled
+	_boss_respawn_check.disabled = not _boss_check.button_pressed
+	_add_menu_item(_boss_respawn_check)
+	_on_boss_toggled(_boss_check.button_pressed)
+
 	var start_btn := _make_menu_button("Start Host")
 	start_btn.pressed.connect(_host_game)
 	_add_menu_item(start_btn)
@@ -192,6 +249,18 @@ func _on_bots_toggled(enabled: bool) -> void:
 	if _difficulty_options != null:
 		_difficulty_options.disabled = not enabled
 		_difficulty_options.modulate = Color.WHITE if enabled else Color(0.55, 0.55, 0.6)
+
+
+func _on_boss_toggled(enabled: bool) -> void:
+	for control in [_boss_health_spin, _boss_scale_spin, _boss_cooldown_spin, _boss_speed_spin]:
+		var spin := control as SpinBox
+		if spin == null:
+			continue
+		spin.editable = enabled
+		spin.modulate = Color.WHITE if enabled else Color(0.55, 0.55, 0.6)
+	if _boss_respawn_check != null:
+		_boss_respawn_check.disabled = not enabled
+		_boss_respawn_check.modulate = Color.WHITE if enabled else Color(0.55, 0.55, 0.6)
 
 
 func _make_menu_button(text: String) -> Button:
@@ -222,6 +291,14 @@ func _host_game() -> void:
 	GameSettings.bots_enabled = _bots_check == null or _bots_check.button_pressed
 	GameSettings.bot_count = int(_bot_count_spin.value) if _bot_count_spin != null else 1
 	GameSettings.bot_difficulty = _difficulty_options.get_item_text(_difficulty_options.selected) if _difficulty_options != null else "Medium"
+	GameSettings.set_boss_settings(
+		_boss_check != null and _boss_check.button_pressed,
+		int(_boss_health_spin.value) if _boss_health_spin != null else GameSettings.boss_max_health,
+		float(_boss_scale_spin.value) if _boss_scale_spin != null else GameSettings.boss_avatar_scale,
+		float(_boss_cooldown_spin.value) if _boss_cooldown_spin != null else GameSettings.boss_ability_cooldown_scale,
+		float(_boss_speed_spin.value) if _boss_speed_spin != null else GameSettings.boss_movement_speed_scale,
+		_boss_respawn_check != null and _boss_respawn_check.button_pressed
+	)
 	var peer := ENetMultiplayerPeer.new()
 	var err := peer.create_server(DEFAULT_PORT, MAX_PLAYERS)
 	if err != OK:

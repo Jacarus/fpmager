@@ -10,6 +10,7 @@ const LOADOUT_SLOT_COUNT := 3
 const LOADOUT_CREDIT_LIMIT := 120
 const LOADOUT_SLOT_NAMES: Array[String] = ["LMB", "RMB", "Shift"]
 const BEAM_SPEED_COST_SCALE := SpellDefinition.BEAM_SPEED_COST_SCALE
+const WALL_TIME_COST_SCALE := SpellDefinition.WALL_TIME_COST_SCALE
 const MANA_COST_SCALE := SpellDefinition.MANA_COST_SCALE
 const MIN_MANA_COST := SpellDefinition.MIN_MANA_COST
 const SPIRIT_MANA_SURCHARGE := SpellDefinition.SPIRIT_MANA_SURCHARGE
@@ -37,6 +38,7 @@ var _intensity: int = 1
 var _size: int = 1
 var _range_val: int = 1
 var _speed: int = 1
+var _wall_time: int = 4
 var _charging: bool = false
 var _burns: bool = false
 var _cools: bool = false
@@ -63,11 +65,15 @@ var _intensity_slider: HSlider
 var _intensity_val_lbl: Label
 var _size_slider: HSlider
 var _size_val_lbl: Label
+var _range_lbl: Label
 var _range_slider: HSlider
 var _range_val_lbl: Label
 var _speed_lbl: Label
 var _speed_slider: HSlider
 var _speed_val_lbl: Label
+var _wall_time_lbl: Label
+var _wall_time_slider: HSlider
+var _wall_time_val_lbl: Label
 var _attr_panels: Dictionary = {}
 var _complex_panel: PanelContainer
 var _complex_name_label: Label
@@ -350,6 +356,10 @@ func _build_properties_sliders(parent: VBoxContainer) -> void:
 	_speed_slider = _make_slider(1, 10, 1)
 	_speed_slider.value_changed.connect(_on_speed_changed)
 	_speed_val_lbl = _add_slider_to_grid(grid, "Speed", _speed_slider)
+
+	_wall_time_slider = _make_slider(1, 12, 4)
+	_wall_time_slider.value_changed.connect(_on_wall_time_changed)
+	_wall_time_val_lbl = _add_slider_to_grid(grid, "Wall Time", _wall_time_slider)
 
 
 func _build_attribute_panels(parent: VBoxContainer) -> void:
@@ -652,6 +662,10 @@ func _add_slider_to_grid(grid: GridContainer, label_text: String, slider: HSlide
 	grid.add_child(lbl)
 	if label_text == "Speed":
 		_speed_lbl = lbl
+	elif label_text == "Range":
+		_range_lbl = lbl
+	elif label_text == "Wall Time":
+		_wall_time_lbl = lbl
 	grid.add_child(slider)
 	var val_lbl := Label.new()
 	val_lbl.text = "1"
@@ -1013,9 +1027,19 @@ func _refresh() -> void:
 
 	_charging_row.visible = _selected_shape == "Sphere"
 	var uses_speed := _selected_shape != "Wall"
+	var uses_range := _selected_shape != "Wall"
+	var uses_wall_time := _selected_shape == "Wall"
+	if _range_lbl != null:
+		_range_lbl.visible = uses_range
+	_range_slider.visible = uses_range
+	_range_val_lbl.visible = uses_range
 	_speed_lbl.visible = uses_speed
 	_speed_slider.visible = uses_speed
 	_speed_val_lbl.visible = uses_speed
+	if _wall_time_lbl != null:
+		_wall_time_lbl.visible = uses_wall_time
+	_wall_time_slider.visible = uses_wall_time
+	_wall_time_val_lbl.visible = uses_wall_time
 
 	var is_complex := _selected_elements.size() > 1
 	_complex_panel.visible = is_complex
@@ -1028,6 +1052,7 @@ func _refresh() -> void:
 	_size_val_lbl.text = str(_size)
 	_range_val_lbl.text = str(_range_val)
 	_speed_val_lbl.text = str(_speed)
+	_wall_time_val_lbl.text = "%ds" % _wall_time
 	_density_val_lbl.text = str(_density)
 	_pull_val_lbl.text = str(_pull)
 
@@ -1054,6 +1079,7 @@ func _apply_lock_state(locked: bool) -> void:
 	_apply_slider_lock(_size_slider, _size, locked)
 	_apply_slider_lock(_range_slider, _range_val, locked)
 	_apply_slider_lock(_speed_slider, _speed, locked)
+	_apply_slider_lock(_wall_time_slider, _wall_time, locked)
 	_apply_slider_lock(_density_slider, _density, locked)
 	_apply_slider_lock(_pull_slider, _pull, locked)
 
@@ -1106,14 +1132,15 @@ func _get_spell_output_text(spell: SpellDefinition) -> String:
 	var push_suffix := " + %.1f push" % spell.calculate_push_force(false) if spell.calculate_push_force(false) > 0.0 else ""
 	var gravity_suffix := " + %.1f gravity" % spell.calculate_gravity_force(0.0, 3.0, false) if spell.calculate_gravity_force(0.0, 3.0, false) > 0.0 else ""
 	var blind_suffix := " + %.1fs blind" % spell.calculate_blind_duration(false) if spell.calculate_blind_duration(false) > 0.0 else ""
+	var wall_suffix := " + %ds wall" % spell.wall_time if spell.shape == "Wall" else ""
 	if spell.is_healing_spell():
-		return ("Healing %d/tick" % spell.calculate_healing(true) if spell.shape == "Beam" else "Healing %d" % spell.calculate_healing()) + push_suffix + gravity_suffix + blind_suffix
-	return ("Damage %d/tick" % spell.calculate_damage(true) if spell.shape == "Beam" else "Damage %d" % spell.calculate_damage()) + push_suffix + gravity_suffix + blind_suffix
+		return ("Healing %d/tick" % spell.calculate_healing(true) if spell.shape == "Beam" else "Healing %d" % spell.calculate_healing()) + push_suffix + gravity_suffix + blind_suffix + wall_suffix
+	return ("Damage %d/tick" % spell.calculate_damage(true) if spell.shape == "Beam" else "Damage %d" % spell.calculate_damage()) + push_suffix + gravity_suffix + blind_suffix + wall_suffix
 
 
 func _apply_slider_lock(slider: HSlider, _current_value: int, _locked: bool) -> void:
 	slider.editable = true
-	slider.max_value = 10
+	slider.max_value = 12 if slider == _wall_time_slider else 10
 
 
 func _on_intensity_changed(value: float) -> void:
@@ -1149,6 +1176,15 @@ func _on_speed_changed(value: float) -> void:
 	if not _accept_slider_change(previous, _speed):
 		_speed = previous
 		_speed_slider.set_value_no_signal(previous)
+	_refresh()
+
+
+func _on_wall_time_changed(value: float) -> void:
+	var previous := _wall_time
+	_wall_time = int(value)
+	if not _accept_slider_change(previous, _wall_time):
+		_wall_time = previous
+		_wall_time_slider.set_value_no_signal(previous)
 	_refresh()
 
 
@@ -1192,6 +1228,8 @@ func _calculate_credits() -> int:
 		cost += (_speed - 1) * 2
 	if _selected_shape == "Beam":
 		cost += int(pow(float(_range_val - 1), 1.5) * 3)
+	elif _selected_shape == "Wall":
+		cost += int(pow(float(maxi(0, _wall_time - 1)), 1.75) * WALL_TIME_COST_SCALE)
 	else:
 		cost += (_range_val - 1) * 2
 	if _burns: cost += 5
@@ -1367,6 +1405,7 @@ func _create_spell_definition() -> SpellDefinition:
 	spell.spell_size = _size
 	spell.spell_range = _range_val
 	spell.spell_speed = _speed
+	spell.wall_time = _wall_time
 	spell.has_charging = _charging
 	spell.burns = _burns
 	spell.cools = _cools
@@ -1412,6 +1451,7 @@ func _apply_spell_definition(spell: SpellDefinition) -> void:
 	_size = spell.spell_size
 	_range_val = spell.spell_range
 	_speed = spell.spell_speed
+	_wall_time = spell.wall_time
 	_charging = spell.has_charging
 	_burns = spell.burns
 	_cools = spell.cools
@@ -1434,6 +1474,7 @@ func _apply_spell_definition(spell: SpellDefinition) -> void:
 	_size_slider.set_value_no_signal(_size)
 	_range_slider.set_value_no_signal(_range_val)
 	_speed_slider.set_value_no_signal(_speed)
+	_wall_time_slider.set_value_no_signal(_wall_time)
 	_burns_cb.set_pressed_no_signal(_burns)
 	_cools_cb.set_pressed_no_signal(_cools)
 	_pushes_cb.set_pressed_no_signal(_pushes)
@@ -1473,6 +1514,7 @@ func _on_cancel_pressed() -> void:
 	_size = 1
 	_range_val = 1
 	_speed = 1
+	_wall_time = 4
 	_charging = false
 	for btn: Button in _element_buttons.values():
 		btn.set_pressed_no_signal(false)
@@ -1485,6 +1527,7 @@ func _on_cancel_pressed() -> void:
 	_size_slider.set_value_no_signal(1)
 	_range_slider.set_value_no_signal(1)
 	_speed_slider.set_value_no_signal(1)
+	_wall_time_slider.set_value_no_signal(4)
 	_name_input.text = _spell_name
 	_reset_attributes()
 	_update_saved_spell_detail()

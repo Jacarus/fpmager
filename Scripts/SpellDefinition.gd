@@ -4,6 +4,7 @@ extends Resource
 const MAX_CREDITS := 100
 const SIMPLE_THRESHOLD := 50
 const BEAM_SPEED_COST_SCALE := 2.78
+const WALL_TIME_COST_SCALE := 0.9
 const MANA_COST_SCALE := 0.6
 const MIN_MANA_COST := 5
 const SPIRIT_MANA_SURCHARGE := 1.65
@@ -106,6 +107,7 @@ const VOID_COMPLEX_EFFECT := {
 @export var spell_size: int = 1
 @export var spell_range: int = 1
 @export var spell_speed: int = 1
+@export var wall_time: int = 4
 @export var has_charging: bool = false
 
 @export var burns: bool = false
@@ -138,6 +140,8 @@ func calculate_credits() -> int:
 		cost += (spell_speed - 1) * 2
 	if shape == "Beam":
 		cost += int(pow(float(spell_range - 1), 1.5) * 3)
+	elif shape == "Wall":
+		cost += int(pow(float(maxi(0, wall_time - 1)), 1.75) * WALL_TIME_COST_SCALE)
 	else:
 		cost += (spell_range - 1) * 2
 	if burns: cost += 5
@@ -176,6 +180,8 @@ func calculate_charged_mana_cost(charged_size: int) -> int:
 
 func calculate_damage(is_beam_tick: bool = false) -> int:
 	if is_healing_spell():
+		return 0
+	if shape == "Wall" and get_base_elements().has("Earth"):
 		return 0
 	var base_damage := float(intensity) * BASE_DAMAGE_MULTIPLIER
 	base_damage += float(spell_size - 1) * 2.5

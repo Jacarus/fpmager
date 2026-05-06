@@ -10,6 +10,8 @@ var _command_poll_timer := 0.0
 var _command_file_path := ""
 var _command_file_offset := 0
 var _command_file_buffer := ""
+var _command_file_read_error_logged := false
+var _world_ready := false
 
 
 func _ready() -> void:
@@ -77,19 +79,34 @@ func _init_command_file() -> void:
 	_command_file_path = OS.get_environment("SERVER_COMMAND_FILE")
 	if _command_file_path == "":
 		_command_file_path = "user://server_commands.txt"
+	if not FileAccess.file_exists(_command_file_path):
+		var create_file := FileAccess.open(_command_file_path, FileAccess.WRITE)
+		if create_file == null:
+			push_warning("[Server] Command file cannot be created: %s (%s)" % [_command_file_path, error_string(FileAccess.get_open_error())])
+			return
+		create_file.close()
+		print("[Server] Created command file: %s" % _command_file_path)
 	var file := FileAccess.open(_command_file_path, FileAccess.READ)
 	if file != null:
 		_command_file_offset = file.get_length()
 		file.close()
+	else:
+		push_warning("[Server] Command file cannot be read: %s (%s)" % [_command_file_path, error_string(FileAccess.get_open_error())])
 	print("[Server] Command file: %s" % _command_file_path)
 
 
 func _poll_server_commands() -> void:
+	if not _world_ready:
+		return
 	if _command_file_path == "":
 		return
 	var file := FileAccess.open(_command_file_path, FileAccess.READ)
 	if file == null:
+		if not _command_file_read_error_logged:
+			_command_file_read_error_logged = true
+			push_warning("[Server] Command file poll failed: %s (%s)" % [_command_file_path, error_string(FileAccess.get_open_error())])
 		return
+	_command_file_read_error_logged = false
 	var length := file.get_length()
 	if length < _command_file_offset:
 		_command_file_offset = 0
@@ -118,7 +135,11 @@ func _run_server_command(raw_command: String) -> void:
 	if command.is_empty() or command.begins_with("#"):
 		return
 	print("[ServerCommand] > %s" % command)
-	var result := GameSettings.apply_server_command(command)
+	var result := _try_run_world_command(command)
+	if not bool(result.get("handled", false)):
+		result = GameSettings.apply_server_command(command)
+		if bool(result.get("ok", false)) and _is_bot_settings_command(command):
+			_force_world_bot_reconcile()
 	var message := str(result.get("message", ""))
 	if bool(result.get("ok", false)):
 		if message != "":
@@ -127,9 +148,159 @@ func _run_server_command(raw_command: String) -> void:
 		print("[ServerCommand] ERROR: %s" % message)
 
 
+func _is_bot_settings_command(command: String) -> bool:
+	var parts := command.split(" ", false)
+	if parts.is_empty():
+		return false
+	return parts[0].to_lower() in ["bots", "bot_count", "botcount", "bot_difficulty", "botdifficulty", "difficulty"]
+
+
+func _force_world_bot_reconcile() -> void:
+	var world := get_tree().current_scene
+	if world == null:
+		push_warning("[Server] Cannot reconcile bots: world not loaded.")
+		return
+	if not world.has_method("force_reconcile_bots"):
+		push_warning("[Server] Current scene does not support force_reconcile_bots().")
+		return
+	world.force_reconcile_bots()
+
+
+func _try_run_world_command(command: String) -> Dictionary:
+	var parts := command.split(" ", false)
+	if parts.is_empty():
+		return {"handled": false}
+	var first := parts[0].to_lower()
+	if first == "bot" and parts.size() >= 2:
+		var bot_action := parts[1].to_lower()
+		var bot_world := get_tree().current_scene
+		if bot_world == null:
+			return {"handled": true, "ok": false, "message": "World not loaded."}
+		match bot_action:
+			"status":
+				var bot_count: int = bot_world.get("_basic_casters").size() if bot_world.get("_basic_casters") != null else -1
+				return {"handled": true, "ok": true, "message": "world bot count: %d  settings: %s" % [bot_count, GameSettings.get_bot_settings_summary()]}
+			"reconcile":
+				_force_world_bot_reconcile()
+				return {"handled": true, "ok": true, "message": "bot reconcile requested. settings: %s" % GameSettings.get_bot_settings_summary()}
+			_:
+				return {"handled": true, "ok": false, "message": "Unknown bot action '%s'. Try: bot status, bot reconcile" % bot_action}
+	if first != "boss":
+		return {"handled": false}
+	var world := get_tree().current_scene
+	if world == null:
+		return {"handled": true, "ok": false, "message": "World is not loaded yet."}
+	if parts.size() < 2:
+		return {"handled": true, "ok": true, "message": _boss_command_help()}
+	var action := parts[1].to_lower()
+	match action:
+		"spawn":
+			if not world.has_method("spawn_boss"):
+				return {"handled": true, "ok": false, "message": "Current scene cannot spawn bosses."}
+			var settings := _parse_boss_settings(parts)
+			var ok := bool(world.spawn_boss(settings))
+			var spawn_message := "boss spawned %s" % str(settings) if ok else "Boss spawn rejected."
+			return {"handled": true, "ok": ok, "message": spawn_message}
+		"replace", "respawn", "restart":
+			if not world.has_method("spawn_boss"):
+				return {"handled": true, "ok": false, "message": "Current scene cannot spawn bosses."}
+			var settings := _parse_boss_settings(parts)
+			settings["replace_existing"] = true
+			if not settings.has("boss_id"):
+				settings["boss_id"] = 0
+			var ok := bool(world.spawn_boss(settings))
+			var replace_message := "boss replaced %s" % str(settings) if ok else "Boss replace rejected."
+			return {"handled": true, "ok": ok, "message": replace_message}
+		"despawn", "remove":
+			if not world.has_method("despawn_boss"):
+				return {"handled": true, "ok": false, "message": "Current scene cannot despawn bosses."}
+			var boss_id := int(parts[2]) if parts.size() >= 3 and parts[2].is_valid_int() else 0
+			var ok := bool(world.despawn_boss(boss_id))
+			var despawn_message := "boss %d despawned" % boss_id if ok else "No boss %d exists." % boss_id
+			return {"handled": true, "ok": ok, "message": despawn_message}
+		"status":
+			return {"handled": true, "ok": true, "message": _get_boss_status_message(world)}
+		"help":
+			return {"handled": true, "ok": true, "message": _boss_command_help()}
+		_:
+			return {"handled": true, "ok": false, "message": _boss_command_help()}
+
+
+func _parse_boss_settings(parts: PackedStringArray) -> Dictionary:
+	var settings := {}
+	for i in range(2, parts.size()):
+		var token := parts[i]
+		var key := ""
+		var value := ""
+		if token.find("=") >= 0:
+			var pair := token.split("=", false, 1)
+			key = pair[0].to_lower()
+			value = pair[1]
+		elif token.is_valid_int() and not settings.has("max_health"):
+			key = "health"
+			value = token
+		else:
+			continue
+		match key:
+			"id", "boss_id":
+				if value.is_valid_int():
+					settings["boss_id"] = int(value)
+			"health", "max_health":
+				if value.is_valid_int():
+					settings["max_health"] = maxi(1, int(value))
+			"scale", "avatar_scale":
+				if value.is_valid_float():
+					settings["avatar_scale"] = maxf(0.35, float(value))
+			"cooldown", "cooldown_scale", "ability_cooldown_scale":
+				if value.is_valid_float():
+					settings["ability_cooldown_scale"] = maxf(0.25, float(value))
+			"speed", "move_speed", "movement_speed", "movement_speed_scale":
+				if value.is_valid_float():
+					settings["movement_speed_scale"] = maxf(0.25, float(value))
+			"respawn", "respawns", "respawn_enabled":
+				settings["respawn_enabled"] = _parse_bool(value)
+			"replace", "replace_existing", "force":
+				settings["replace_existing"] = _parse_bool(value)
+			"respawn_delay":
+				if value.is_valid_float():
+					settings["respawn_delay"] = maxf(0.1, float(value))
+			"despawn_delay":
+				if value.is_valid_float():
+					settings["despawn_delay"] = maxf(0.1, float(value))
+			"name", "display_name":
+				settings["display_name"] = value.replace("_", " ")
+			"blind":
+				settings["blind_volley_enabled"] = value.to_lower() not in ["0", "false", "off", "no"]
+			"aoe":
+				settings["large_aoe_enabled"] = value.to_lower() not in ["0", "false", "off", "no"]
+			"gravity", "singularity":
+				settings["singularity_enabled"] = value.to_lower() not in ["0", "false", "off", "no"]
+	return settings
+
+
+func _parse_bool(value: String) -> bool:
+	return value.to_lower() not in ["0", "false", "off", "no", "disabled"]
+
+
+func _get_boss_status_message(world: Node) -> String:
+	if world.has_method("get_boss_count"):
+		return "boss_count=%d" % int(world.get_boss_count())
+	return "boss status unavailable"
+
+
+func _boss_command_help() -> String:
+	return "Commands: boss spawn [health] [name=Aether_Colossus] [scale=1.0] [cooldown=1.0] [speed=1.0] [respawn=off] [replace=off] [blind=on] [aoe=on] [gravity=on], boss replace [settings], boss despawn [id], boss status"
+
+
 func _on_peer_connected(id: int) -> void:
 	print("[Server] Peer %d connected  (total peers: %d)" % [id, multiplayer.get_peers().size()])
 
 
 func _on_peer_disconnected(id: int) -> void:
 	print("[Server] Peer %d disconnected" % id)
+
+
+func notify_world_ready() -> void:
+	_world_ready = true
+	print("[Server] World ready, processing any pending commands...")
+	_poll_server_commands()

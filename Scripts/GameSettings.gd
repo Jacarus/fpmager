@@ -1,6 +1,7 @@
 extends Node
 
 signal bot_settings_changed
+signal boss_settings_changed
 signal fullscreen_changed(enabled: bool)
 
 const MIN_BOT_COUNT := 0
@@ -10,6 +11,12 @@ const DIFFICULTIES := ["Easy", "Medium", "Hard"]
 var bots_enabled: bool = true
 var bot_count: int = 1
 var bot_difficulty: String = "Medium"
+var boss_enabled: bool = false
+var boss_max_health: int = 1800
+var boss_avatar_scale: float = 1.0
+var boss_ability_cooldown_scale: float = 1.0
+var boss_movement_speed_scale: float = 1.0
+var boss_respawn_enabled: bool = false
 
 
 func has_window_display() -> bool:
@@ -50,6 +57,54 @@ func set_bot_settings(enabled: bool, count: int = bot_count, difficulty: String 
 	return changed
 
 
+func set_boss_settings(
+	enabled: bool,
+	max_health: int = boss_max_health,
+	avatar_scale: float = boss_avatar_scale,
+	ability_cooldown_scale: float = boss_ability_cooldown_scale,
+	movement_speed_scale: float = boss_movement_speed_scale,
+	respawn_enabled: bool = boss_respawn_enabled
+) -> bool:
+	var normalized_health := maxi(100, max_health)
+	var normalized_scale := clampf(avatar_scale, 0.5, 2.5)
+	var normalized_cooldown := clampf(ability_cooldown_scale, 0.25, 3.0)
+	var normalized_move_speed := clampf(movement_speed_scale, 0.25, 3.0)
+	var changed := (
+		boss_enabled != enabled
+		or boss_max_health != normalized_health
+		or not is_equal_approx(boss_avatar_scale, normalized_scale)
+		or not is_equal_approx(boss_ability_cooldown_scale, normalized_cooldown)
+		or not is_equal_approx(boss_movement_speed_scale, normalized_move_speed)
+		or boss_respawn_enabled != respawn_enabled
+	)
+	boss_enabled = enabled
+	boss_max_health = normalized_health
+	boss_avatar_scale = normalized_scale
+	boss_ability_cooldown_scale = normalized_cooldown
+	boss_movement_speed_scale = normalized_move_speed
+	boss_respawn_enabled = respawn_enabled
+	if changed:
+		boss_settings_changed.emit()
+	return changed
+
+
+func get_boss_spawn_settings() -> Dictionary:
+	return {
+		"boss_id": 0,
+		"display_name": "Aether Colossus",
+		"max_health": boss_max_health,
+		"avatar_scale": boss_avatar_scale,
+		"ability_cooldown_scale": boss_ability_cooldown_scale,
+		"movement_speed_scale": boss_movement_speed_scale,
+		"respawn_enabled": boss_respawn_enabled,
+		"respawn_delay": 10.0,
+		"despawn_delay": 5.0,
+		"blind_volley_enabled": true,
+		"large_aoe_enabled": true,
+		"singularity_enabled": true,
+	}
+
+
 func apply_server_command(command: String) -> Dictionary:
 	var cleaned := command.strip_edges()
 	if cleaned.is_empty() or cleaned.begins_with("#"):
@@ -58,8 +113,8 @@ func apply_server_command(command: String) -> Dictionary:
 	if parts.is_empty():
 		return {"ok": true, "message": ""}
 
-	var name := parts[0].to_lower()
-	match name:
+	var cmd := parts[0].to_lower()
+	match cmd:
 		"help":
 			return {"ok": true, "message": _server_command_help()}
 		"status", "bot_status":
@@ -88,9 +143,11 @@ func _apply_bots_command(parts: PackedStringArray) -> Dictionary:
 	var value := parts[1].to_lower()
 	if value in ["on", "true", "yes", "1", "enable", "enabled"]:
 		set_bot_settings(true, maxi(bot_count, 1), bot_difficulty)
+		bot_settings_changed.emit()
 		return {"ok": true, "message": get_bot_settings_summary()}
 	if value in ["off", "false", "no", "0", "disable", "disabled"]:
 		set_bot_settings(false, bot_count, bot_difficulty)
+		bot_settings_changed.emit()
 		return {"ok": true, "message": get_bot_settings_summary()}
 	if value in ["count", "number"]:
 		if parts.size() < 3:
@@ -103,6 +160,7 @@ func _apply_bots_command(parts: PackedStringArray) -> Dictionary:
 	if parts[1].is_valid_int():
 		var count := clampi(int(parts[1]), MIN_BOT_COUNT, MAX_BOT_COUNT)
 		set_bot_settings(count > 0, count, bot_difficulty)
+		bot_settings_changed.emit()
 		return {"ok": true, "message": get_bot_settings_summary()}
 	return {"ok": false, "message": "Usage: bots <on|off|count|difficulty|0-12>"}
 
@@ -112,6 +170,7 @@ func _apply_bot_count(value: String) -> Dictionary:
 		return {"ok": false, "message": "Bot count must be a number from 0 to 12."}
 	var count := clampi(int(value), MIN_BOT_COUNT, MAX_BOT_COUNT)
 	set_bot_settings(count > 0, count, bot_difficulty)
+	bot_settings_changed.emit()
 	return {"ok": true, "message": get_bot_settings_summary()}
 
 
@@ -120,6 +179,7 @@ func _apply_bot_difficulty(value: String) -> Dictionary:
 	if not DIFFICULTIES.has(difficulty):
 		return {"ok": false, "message": "Bot difficulty must be Easy, Medium, or Hard."}
 	set_bot_settings(bots_enabled, bot_count, difficulty)
+	bot_settings_changed.emit()
 	return {"ok": true, "message": get_bot_settings_summary()}
 
 

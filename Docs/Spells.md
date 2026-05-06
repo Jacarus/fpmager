@@ -347,6 +347,10 @@ Certain base effects interact with each other on a target, distinct from spell-v
     Burn (from Fire) + Cools (from Water):
         → Extinguish: removes Burn immediately
         → If Water spell intensity > 5: also applies Wet (reduces next Fire damage by 30%)
+        Current runtime: Burn is a damage-over-time status applied by actual spell
+        contact. Active impact/area damage only applies while the target overlaps the
+        visible spell effect; after leaving, only applied DoT statuses such as Burn
+        keep ticking.
 
     Burn (from Fire) + Blows (from Air):
         → Fanned: Burn ticks 50% faster (Air spreads combustion)
@@ -411,6 +415,9 @@ The base cost formula with multi-base support:
 
     Current runtime implementation:
         -Spell creation credits remain the source of truth for spell complexity.
+        -Wall spells have a separate Time property, measured in seconds. Time controls
+         how long the wall exists before expiring, and longer wall times add
+         exponentially more spell credits, which also increases mana cost.
         -Mana cost is derived from credits:
             mana_cost = max(5, ceil(credits × 0.6))
         -Any spell containing Spirit has a large mana surcharge:
@@ -464,7 +471,10 @@ The base cost formula with multi-base support:
         For multiplayer testing, any Water hit gives players a small minimum shove,
         while Push-enabled Water scales that shove higher.
         Player-cast push spells also produce reduced caster recoil when the beam or
-        sphere impacts a target or surface, making Water useful for movement tests.
+        sphere impacts a nearby target or surface. Recoil falls off with distance,
+        so distant Water impacts do not move the caster.
+        Moving projectiles ignore their caster's own body; only confirmed nearby
+        impact recoil or lingering area effects can move the caster.
         The world includes a blue "PUSH TEST" rigid body near the NPC spawn. It reacts
         to any Water hit with a minimum physics impulse, and Push-enabled Water hits
         scale that impulse higher, so push can be tested independently of NPC movement.
@@ -515,6 +525,8 @@ The base cost formula with multi-base support:
     Impact and reaction area damage:
         -Impact effects are no longer only visual. While they linger, they periodically apply
          reduced tick damage or healing to damageable actors inside their radius.
+        -Impact and reaction area ticks use the effect's currently visible overlap radius,
+         so targets that fully dodge the visible effect do not take lingering area damage.
         -Player-created spells affect the caster too. Damage, healing, blind, push, and
          gravity from the player's own lingering impacts are applied if the player is in range.
         -Steam Cloud damage comes from the Fire/Water reaction spell that created it, so a
@@ -526,6 +538,9 @@ The base cost formula with multi-base support:
 
     Current gameplay:
         -Player HUD shows health and mana.
+        -Boss HUD shows an encounter-wide health bar to every player when a boss is
+         alive. The boss also exposes per-part health in the HUD so players can see
+         which abilities are still active.
         -When bots are enabled, each NPC caster receives three random sphere spells
          from a bot spell pool that includes Fire, Water Push, Light Flash,
          Void/Earth Singularity, and mixed-base variants for testing damage, push,
@@ -535,6 +550,23 @@ The base cost formula with multi-base support:
          budget, and Hard bots get one-and-a-half times the player budget. Bots only
          cast when they have enough mana.
         -NPC casters move around the arena while maintaining casting pressure.
+        -Boss NPCs use boss-only spells that bypass player loadout limits. Current
+         examples are Prism Split, which fires five normal Light sphere projectiles
+         from the Prism Arm; Cataclysm, a huge telegraphed Fire/Earth AOE from the
+         Core; and Gravity Wells, several telegraphed Void/Earth pull fields from the
+         Gravity Arm. Boss component max health scales with the boss's configured
+         max health. Destroying the responsible boss part disables that spell, and
+         destroying the Anchor Feet prevents boss movement.
+        -Boss ground attacks are not instant. They create replicated warning circles
+         with countdown labels before the server-authoritative impact appears, giving
+         players time to dodge. Projectile-style boss attacks use the shared
+         projectile system so they can be seen and countered like player spells.
+        -Boss ground attacks are also self-safe: the AI will not place Cataclysm or
+         Gravity Wells inside the boss's own damage radius. Defeated bosses either
+         respawn if that option is enabled or despawn after 5 seconds.
+        -Boss spells can damage the boss if they overlap it. The boss AI should avoid
+         firing projectile attacks that would immediately detonate close enough to
+         hurt itself, such as into a nearby wall.
         -Player spells can damage or heal damageable targets.
         -Lingering impact/reaction effects damage or heal targets standing inside them.
         -Spell creator and in-game spell labels show runtime mana and damage values.
@@ -591,10 +623,27 @@ For the engine implementation, evaluate in this order per frame:
         → Void spells ignore most surfaces (no density interaction)
     4. Spell vs Target    (entity hit)
 
-Current gameplay implementation:
+    Current gameplay implementation:
     -World floors, walls, and obstacle boxes have physics collisions.
     -Moving sphere spells raycast/sweep along their travel path each frame.
     -On collision with world geometry, the projectile is consumed and spawns its impact effect.
+    -Wall-shaped spells persist as blocking spell objects with health derived from
+     their intensity, size, and base elements. Earth and Void walls are tougher,
+     while Light and Spirit walls are more fragile.
+    -Earth walls are physical terrain: players cannot pass through them, can use
+     them to body-block movement, and can stand on them. They do not deal direct
+     spell damage.
+    -Wall lifetime is controlled by the wall's Time property, not by spell Range.
+    -Wall visuals communicate both failure modes: cracks appear as wall health is
+     depleted by blocked damage, and the wall becomes more transparent as its timed
+     lifetime approaches expiry.
+    -Walls consume incoming projectile and beam damage before it can pass through.
+     Same-base hits deal heavily reduced wall damage, while opposed-base hits deal
+     increased wall damage and can create the normal reaction effect, such as
+     Fire/Water steam.
+    -Reaction effects created on a wall are blocked on the protected side of that
+     wall. A player directly behind the wall does not take immediate steam/reaction
+     damage, but players in front of the wall or beside the impact can be affected.
     -Beam spells raycast to world geometry and repeatedly spawn impact effects while held on a surface.
     -Complex spell impact visuals use their identity profile and pentagon stats to determine radius/lifetime.
     -Moving spell projectiles now detect nearby spell projectiles and run collision resolution.
