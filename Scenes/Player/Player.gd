@@ -832,6 +832,10 @@ func _stop_beam() -> void:
 	_broadcast_beam_stop()
 
 
+func stop_beam() -> void:
+	_stop_beam()
+
+
 func _update_beam() -> void:
 	if _active_beam == null or _active_beam_spell == null:
 		return

@@ -304,6 +304,9 @@ func _on_peer_disconnected(peer_id: int) -> void:
 func _despawn_player_for_peer(peer_id: int) -> void:
 	var player := _players.get(peer_id) as Node
 	if player != null:
+		# Stop any active beam before despawning to prevent RPC errors
+		if player.has_method("stop_beam"):
+			player.stop_beam()
 		player.queue_free()
 		unregister_beam_segment("player:%d" % peer_id)
 		_players.erase(peer_id)
@@ -815,8 +818,6 @@ func _close_spell_creator_overlay() -> void:
 
 
 func _refresh_basic_caster_target() -> void:
-	if _basic_caster == null:
-		return
 	var best_player: Node3D = null
 	for player in _players.values():
 		if player is Node3D:
