@@ -979,6 +979,9 @@ func _broadcast_beam_stop() -> void:
 func _server_start_beam_visual(spell_data: Dictionary) -> void:
 	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
 		return
+	# Check if node is still in scene tree (may have been despawned)
+	if not is_inside_tree():
+		return
 	_client_start_beam_visual.rpc(spell_data, _network_peer_id)
 	_start_remote_beam_visual(SpellNetworkCodecScript.from_dict(spell_data))
 
@@ -986,6 +989,9 @@ func _server_start_beam_visual(spell_data: Dictionary) -> void:
 @rpc("any_peer", "unreliable")
 func _server_update_beam_visual(origin: Vector3, target: Vector3) -> void:
 	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
+		return
+	# Check if node is still in scene tree (may have been despawned)
+	if not is_inside_tree():
 		return
 	var broadcast_target := target
 	var broadcast_blocked := false
@@ -1001,6 +1007,9 @@ func _server_update_beam_visual(origin: Vector3, target: Vector3) -> void:
 @rpc("any_peer", "reliable")
 func _server_stop_beam_visual() -> void:
 	if not multiplayer.is_server() or multiplayer.get_remote_sender_id() != _network_peer_id:
+		return
+	# Check if node is still in scene tree (may have been despawned)
+	if not is_inside_tree():
 		return
 	var world := get_tree().current_scene
 	if world != null and world.has_method("unregister_beam_segment"):
