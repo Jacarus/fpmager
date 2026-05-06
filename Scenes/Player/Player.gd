@@ -832,8 +832,25 @@ func _stop_beam() -> void:
 	_broadcast_beam_stop()
 
 
-func stop_beam() -> void:
-	_stop_beam()
+func stop_beam(broadcast: bool = true) -> void:
+	if broadcast:
+		_stop_beam()
+	else:
+		# Stop beam without broadcasting RPCs (for cleanup during despawn)
+		if _active_beam == null:
+			return
+		_active_beam.queue_free()
+		_active_beam = null
+		_active_beam_spell = null
+		_beam_visible_length = 0.0
+		_beam_impact_timer = 0.0
+		_beam_core = null
+		_beam_tip = null
+		_beam_light = null
+		_server_beam_correction_time = -1.0
+		var world := get_tree().current_scene
+		if world != null and world.has_method("unregister_beam_segment"):
+			world.unregister_beam_segment(_get_beam_source_key())
 
 
 func _update_beam() -> void:

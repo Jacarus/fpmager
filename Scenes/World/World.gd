@@ -305,8 +305,9 @@ func _despawn_player_for_peer(peer_id: int) -> void:
 	var player := _players.get(peer_id) as Node
 	if player != null:
 		# Stop any active beam before despawning to prevent RPC errors
+		# Don't broadcast RPCs since the player is being removed
 		if player.has_method("stop_beam"):
-			player.stop_beam()
+			player.stop_beam(false)
 		player.queue_free()
 		unregister_beam_segment("player:%d" % peer_id)
 		_players.erase(peer_id)
